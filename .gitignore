@@ -1,0 +1,8 @@
+# Ignore JSON and Markdown files anywhere in the repository
+**/*.json
+**/*.md
+
+# Ignore environment files
+.env
+*.env
+
