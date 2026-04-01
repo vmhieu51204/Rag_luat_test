@@ -2,22 +2,70 @@
 CASELAW FIELD EXTRACTION — TEST REPORT
 ================================================================================
 
-Total files processed: 1
+Total files processed: 2985
 
 Case type distribution:
-  so_tham         :   1 (100.0%)
+  phuc_tham       : 137 (4.6%)
+  so_tham         : 2835 (95.0%)
+  unknown         :  13 (0.4%)
 
 ────────────────────────────────────────────────────────────────────────────────
 FIELD EXTRACTION SUCCESS RATES
 ────────────────────────────────────────────────────────────────────────────────
 Field                                          Success    Total     Rate
 ───────────────────────────────────────────── ──────── ──────── ────────
-Danh_sach_bi_cao                                     1        1   100.0%
-Noi_dung.Qua_trinh_dieu_tra                          1        1   100.0%
-Noi_dung.Ket_luan_cac_ben                            1        1   100.0%
-Nhan_dinh_cua_toa_an                                 1        1   100.0%
-QUYET_DINH                                           1        1   100.0%
+Danh_sach_bi_cao                                  2985     2985   100.0%
+Noi_dung.Qua_trinh_dieu_tra                       2975     2985    99.7%
+Noi_dung.Ket_luan_cac_ben                         2953     2985    98.9%
+Nhan_dinh_cua_toa_an                              2985     2985   100.0%
+QUYET_DINH                                        2985     2985   100.0%
 
 ────────────────────────────────────────────────────────────────────────────────
 FAILED FILES PER FIELD (showing max 10)
 ────────────────────────────────────────────────────────────────────────────────
+
+  Noi_dung.Qua_trinh_dieu_tra (10 failures):
+    ✗ 05-03-2024-Khanh_Hoa-2ta1653946t1cvn.md
+    ✗ 17-06-2024-Khanh_Hoa-2ta1538427t1cvn.md
+    ✗ 17-06-2024-Khanh_Hoa-2ta1654016t1cvn.md
+    ✗ 20-02-2024-Khanh_Hoa-2ta1443949t1cvn.md
+    ✗ 20-02-2024-Khanh_Hoa-2ta1654196t1cvn.md
+    ✗ 21-02-2024-Khanh_Hoa-2ta1443905t1cvn.md
+    ✗ 21-02-2024-Khanh_Hoa-2ta1443961t1cvn.md
+    ✗ 26-03-2024-Khanh_Hoa-2ta1654212t1cvn.md
+    ✗ 26-06-2024-Khanh_Hoa-2ta1544164t1cvn.md
+    ✗ 27-03-2024-Khanh_Hoa-2ta1654443t1cvn.md
+
+  Noi_dung.Ket_luan_cac_ben (32 failures):
+    ✗ 04-12-2024-Binh_Thuan-2ta1748370t1cvn.md
+    ✗ 05-03-2024-Khanh_Hoa-2ta1653946t1cvn.md
+    ✗ 07-03-2024-Gia_Lai-2ta1470776t1cvn.md
+    ✗ 09-09-2024-Ben_Tre-2ta1597712t1cvn.md
+    ✗ 12-07-2024-Phu_Tho-2ta1571532t1cvn.md
+    ✗ 12-08-2024-Gia_Lai-2ta1634507t1cvn.md
+    ✗ 12-12-2024-Thanh_Hoa-2ta1707065t1cvn.md
+    ✗ 13-08-2024-Phu_Tho-2ta1610943t1cvn.md
+    ✗ 17-06-2024-Khanh_Hoa-2ta1538427t1cvn.md
+    ✗ 17-06-2024-Khanh_Hoa-2ta1654016t1cvn.md
+    ✗ 18-06-2024-Bac_Giang-2ta1657583t1cvn.md
+    ✗ 19-08-2024-Gia_Lai-2ta1634543t1cvn.md
+    ✗ 20-02-2024-Khanh_Hoa-2ta1443949t1cvn.md
+    ✗ 20-02-2024-Khanh_Hoa-2ta1654196t1cvn.md
+    ✗ 20-05-2024-Nam_Dinh-2ta1505130t1cvn.md
+    ✗ 21-02-2024-Khanh_Hoa-2ta1443905t1cvn.md
+    ✗ 21-02-2024-Khanh_Hoa-2ta1443961t1cvn.md
+    ✗ 21-03-2024-Binh_Duong-2ta1446876t1cvn.md
+    ✗ 21-10-2024-Thanh_Hoa-2ta1869423t1cvn.md
+    ✗ 23-01-2024-Hai_Phong-2ta1515894t1cvn.md
+    ✗ 23-09-2024-Dak_Lak-2ta1666128t1cvn.md
+    ✗ 23-09-2024-Thanh_Hoa-2ta1661654t1cvn.md
+    ✗ 25-09-2024-Thanh_Hoa-2ta1707633t1cvn.md
+    ✗ 26-03-2024-Khanh_Hoa-2ta1654212t1cvn.md
+    ✗ 26-06-2024-Khanh_Hoa-2ta1544164t1cvn.md
+    ✗ 26-08-2024-Ho_Chi_Minh-2ta1788716t1cvn.md
+    ✗ 26-08-2024-Ho_Chi_Minh-2ta1788746t1cvn.md
+    ✗ 26-08-2024-Thanh_Hoa-2ta1659180t1cvn.md
+    ✗ 27-03-2024-Khanh_Hoa-2ta1654443t1cvn.md
+    ✗ 30-05-2024-Binh_Thuan-2ta1527080t1cvn.md
+    ✗ 30-05-2024-Binh_Thuan-2ta1587132t1cvn.md
+    ✗ 31-07-2024-Binh_Thuan-2ta1618819t1cvn.md

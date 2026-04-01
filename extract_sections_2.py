@@ -237,6 +237,8 @@ def extract_nhan_dinh_points(nhan_dinh: Optional[str]) -> Optional[dict[str, str
       - [1] ...
       [2] ...
       * [3] ...
+            #### [4] ...
+            **[5]** ...
     """
     if not nhan_dinh:
         return None
@@ -245,7 +247,9 @@ def extract_nhan_dinh_points(nhan_dinh: Optional[str]) -> Optional[dict[str, str
     if not text:
         return None
 
-    point_re = re.compile(r'(?m)^\s*(?:[-*]\s*)?\[\s*(\d+)\s*\]\s*')
+    point_re = re.compile(
+        r'(?m)^\s*(?:#{1,6}\s*)?(?:[-*+]\s*)?(?:\*\*)?\[\s*(\d+)\s*\](?:\*\*)?\s*(?:[.)\-:]\s*)?'
+    )
     matches = list(point_re.finditer(text))
 
     if not matches:
