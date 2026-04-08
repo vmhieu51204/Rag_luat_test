@@ -120,4 +120,3 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-#/home/hieujayce/Downloads/complete_repo/.venv/bin/python evaluate.py --train_dir ./chunk/Chuong_XXII_chunked/train --test_dir ./chunk/Chuong_XXII_chunked/synth/split --train_db_dir ./output/chroma_db_train --test_db_dir ./output/chroma_db_test_split --top_k 10 --results_out ./output/eval_results_synth_split.json

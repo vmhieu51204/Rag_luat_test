@@ -81,6 +81,32 @@ def run_pipeline_embedding(input_dir: str, db_dir: str) -> None:
     subprocess.run(cmd, check=True)
 
 
+def extract_article_signatures(articles) -> set[str]:
+    """
+    Given `Cac_Dieu_Quyet_Dinh` which may be a dict { defendant: [ [dieu, khoan, diem], ... ] },
+    collapse into a set of unique string signatures for evaluation.
+    """
+    signatures = set()
+    if isinstance(articles, dict):
+        for val_list in articles.values():
+            if isinstance(val_list, list):
+                for item in val_list:
+                    if isinstance(item, list):
+                        signatures.add("-".join(str(i) for i in item))
+                    else:
+                        signatures.add(str(item))
+            else:
+                signatures.add(str(val_list))
+    elif isinstance(articles, list):
+        for a in articles:
+            if isinstance(a, list):
+                signatures.add("-".join(str(i) for i in a))
+            else:
+                signatures.add(str(a))
+    elif articles:
+        signatures.add(str(articles))
+    return signatures
+
 def load_articles_index(raw_dir: Path) -> dict[str, set[str]]:
     """
     Read every raw JSON in raw_dir and build:
@@ -94,7 +120,7 @@ def load_articles_index(raw_dir: Path) -> dict[str, set[str]]:
         doc_id   = data.get(ID_FIELD, f.stem)
         articles = data.get(ARTICLES_FIELD)
         if articles:
-            index[doc_id] = set(str(a) for a in articles)
+            index[doc_id] = extract_article_signatures(articles)
     return index
 
 def load_test_docs(test_dir: Path) -> list[dict]:
@@ -130,7 +156,7 @@ def load_test_docs(test_dir: Path) -> list[dict]:
         test_docs.append({
             "doc_id":            doc_id,
             "query_text":        query_text,
-            "ground_truth":      set(str(a) for a in articles),
+            "ground_truth":      extract_article_signatures(articles),
         })
 
     if skipped:
