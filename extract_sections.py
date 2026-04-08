@@ -29,15 +29,10 @@ import argparse
 import unicodedata
 from pathlib import Path
 
-# ── Defaults ─────────────────────────────────────────────────────────────────
-INPUT_DIR  = Path(__file__).parent / "ocr_marker_fixed"
-OUTPUT_DIR = Path(__file__).parent / "extracted_json"
+INPUT_DIR  = Path(__file__).parent / "data_create" / "ocr_marker_fixed"
+OUTPUT_DIR = Path(__file__).parent / "data_create" / "extracted_json"
 
-
-# ═════════════════════════════════════════════════════════════════════════════
 #  TEXT HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
-
 def strip_diacritics(text: str) -> str:
     """Remove Vietnamese diacritics / tone marks, keep base latin chars.
     Also converts Đ/đ → D/d (stroke is not a combining mark in Unicode)."""
@@ -45,13 +40,11 @@ def strip_diacritics(text: str) -> str:
     result = "".join(c for c in nfkd if unicodedata.category(c) != "Mn")
     return result.replace("Đ", "D").replace("đ", "d")
 
-
 def norm(line: str) -> str:
     """Normalize a line for matching: strip markdown + diacritics + uppercase."""
     s = re.sub(r"^#{1,6}\s*", "", line.strip())      # heading markers
     s = s.replace("*", "").replace("\\", "").strip()  # bold / italic / escape
     return strip_diacritics(s).upper()
-
 
 def is_heading_style(line: str, max_content_len: int = 40) -> bool:
     """True if line looks like a standalone section header (heading or short)."""
@@ -65,11 +58,7 @@ def is_heading_style(line: str, max_content_len: int = 40) -> bool:
     content_n = strip_diacritics(content).upper().rstrip(":").strip()
     return len(content_n) <= max_content_len
 
-
-# ═════════════════════════════════════════════════════════════════════════════
 #  SECTION BOUNDARY FINDERS
-# ═════════════════════════════════════════════════════════════════════════════
-
 def find_trial_date(lines: list[str]) -> int:
     """Find the trial-session line: 'Ngày DD tháng MM năm YYYY … xét xử …'
     Also handles 'Trong ngày', 'Trong các ngày', 'Từ ngày', and 'DD/MM/YYYY'.
@@ -90,7 +79,6 @@ def find_trial_date(lines: list[str]) -> int:
             return i
     return -1
 
-
 def find_lien_quan(lines: list[str], start: int = 0) -> int:
     """Find 'Người có quyền lợi [,/và] nghĩa vụ liên quan', 'Bị hại', or other parties."""
     for i in range(start, len(lines)):
@@ -107,7 +95,6 @@ def find_lien_quan(lines: list[str], start: int = 0) -> int:
             return i
     return -1
 
-
 def _find_header(lines: list[str], keywords: list[str],
                  start: int = 0, require_heading: bool = False) -> int:
     """Find the first line containing ALL *keywords* (diacritic-stripped).
@@ -122,11 +109,9 @@ def _find_header(lines: list[str], keywords: list[str],
                 return i
     return -1
 
-
 def find_noi_dung(lines: list[str], start: int = 0) -> int:
     """Find 'NỘI DUNG VỤ ÁN'."""
     return _find_header(lines, ["NOI DUNG", "VU AN"], start)
-
 
 def find_nhan_dinh(lines: list[str], start: int = 0) -> int:
     """Find 'NHẬN ĐỊNH CỦA TÒA ÁN' (or 'CỦA HỘI ĐỒNG XÉT XỬ')."""
@@ -148,7 +133,6 @@ def find_nhan_dinh(lines: list[str], start: int = 0) -> int:
         if "NHAN DINH NHU SAU" in n:
             return i
     return -1
-
 
 def find_quyet_dinh(lines: list[str], start: int = 0) -> int:
     """Find the 'QUYẾT ĐỊNH' *section header* (not body-text mentions).
@@ -174,18 +158,13 @@ def find_quyet_dinh(lines: list[str], start: int = 0) -> int:
             return i
     return -1
 
-
-# ═════════════════════════════════════════════════════════════════════════════
 #  EXTRACTION
-# ═════════════════════════════════════════════════════════════════════════════
-
 def _extract(lines: list[str], start: int, end: int) -> str | None:
     """Join lines[start:end], strip outer whitespace. None if invalid bounds."""
     if start < 0 or end < 0 or start >= end:
         return None
     text = "\n".join(lines[start:end]).strip()
     return text or None
-
 
 def process_file(filepath: Path) -> dict:
     """Extract all five sections from one .md file."""
@@ -248,11 +227,7 @@ def process_file(filepath: Path) -> dict:
     }
     return record
 
-
-# ═════════════════════════════════════════════════════════════════════════════
 #  MAIN
-# ═════════════════════════════════════════════════════════════════════════════
-
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Extract sections from court-verdict .md files → JSON")
