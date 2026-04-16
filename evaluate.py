@@ -3,17 +3,20 @@ evaluate.py
 ===========
 Embeds train/test folders into separate ChromaDB directories, then
 queries the train DB with test documents and measures how well the
-retrieved train documents' articles (Cac_Dieu_Quyet_Dinh) overlap with
-the test document ground truth.
+retrieved train documents' legal basis labels overlap with the
+test document ground truth extracted from PHAN_QUYET_CUA_TOA_SO_THAM.
+Only legal-basis items whose Bo_Luat_Va_Van_Ban_Khac contains
+"Bộ luật Hình sự" or "BLHS" are included in scoring.
 
 Evaluation logic
 ----------------
-    1. Run pipeline.py on train_dir -> train_db_dir.
-    2. Run pipeline.py on test_dir  -> test_db_dir.
-    3. For each test document that has Cac_Dieu_Quyet_Dinh:
+    1. Embed train_dir -> train_db_dir  (via embedding_store).
+    2. Embed test_dir  -> test_db_dir   (via embedding_store).
+    3. For each test document with valid PHAN_QUYET_CUA_TOA_SO_THAM and
+       non-empty query text from configured query fields:
              - build query from text fields
              - retrieve top-K chunks from train_db_dir
-             - union retrieved train-doc article IDs
+             - union retrieved train-doc labels
              - compute precision/recall/F1 against test doc ground truth
     4. Macro-average all metrics.
 
@@ -30,139 +33,236 @@ Usage
 
 import argparse
 import json
-import subprocess
-import sys
+import re
+import unicodedata
 from pathlib import Path
 
-# Fields used to build the query text (same order as pipeline.py)
-CONTENT_FIELDS  = ["Summary"]
-ID_FIELD        = "Ma_Ban_An"
-ARTICLES_FIELD  = "Cac_Dieu_Quyet_Dinh"
-COLLECTION_NAME = "legal_chunks_vn"
-MODEL_NAME      = "BAAI/bge-m3"
-DEVICE          = "cuda"
+from embedding_store import (
+    run_pipeline,
+    load_model,
+    load_chroma,
+    COLLECTION_NAME as DEFAULT_COLLECTION_NAME,
+    MODEL_NAME as DEFAULT_MODEL_NAME,
+    DEVICE as DEFAULT_DEVICE,
+    MAX_CHUNK_CHARS as DEFAULT_MAX_CHUNK_CHARS,
+    BATCH_SIZE as DEFAULT_BATCH_SIZE,
+)
+
+# Fields used to build embedding/query text
+TRAIN_EMBED_CONTENT_FIELDS = ["Summary"]
+TEST_EMBED_CONTENT_FIELDS = ["Synthetic_summary"]
+QUERY_CONTENT_FIELDS = ["Synthetic_summary"]
+ID_FIELD = "Ma_Ban_An"
+VERDICT_FIELD = "PHAN_QUYET_CUA_TOA_SO_THAM"
+LEGAL_BASIS_FIELD = "Can_Cu_Dieu_Luat"
+LEGAL_SOURCE_FIELD = "Bo_Luat_Va_Van_Ban_Khac"
+
 
 # Helpers
-def load_model():
-    try:
-        from sentence_transformers import SentenceTransformer
-    except ImportError:
-        print("[ERROR] Run: pip install sentence-transformers")
-        sys.exit(1)
-    print(f"  Loading {MODEL_NAME} on {DEVICE} ...")
-    model = SentenceTransformer(MODEL_NAME, device=DEVICE)
-    return model
+
+def _normalize_token(token: str, *, lowercase: bool = True) -> str:
+    token = token.strip()
+    token = re.sub(r"^(điều|dieu|khoản|khoan|điểm|diem)\s+", "", token, flags=re.IGNORECASE)
+    token = token.strip(" .")
+    token = re.sub(r"\s+", "", token)
+    return token.lower() if lowercase else token
 
 
-def load_chroma(db_dir: str):
-    try:
-        import chromadb
-    except ImportError:
-        print("[ERROR] Run: pip install chromadb")
-        sys.exit(1)
-    client     = chromadb.PersistentClient(path=db_dir)
-    collection = client.get_collection(name=COLLECTION_NAME)
-    return collection
+def _split_multi_value(raw_value, *, lowercase: bool = True) -> list[str]:
+    if raw_value is None:
+        return []
+    raw = str(raw_value).strip()
+    if not raw:
+        return []
+    parts = re.split(r",|;|/|\bvà\b|\bva\b|\band\b", raw, flags=re.IGNORECASE)
+    tokens = [_normalize_token(p, lowercase=lowercase) for p in parts if p.strip()]
+    return [t for t in tokens if t]
 
 
-def run_pipeline_embedding(input_dir: str, db_dir: str) -> None:
-    """Run pipeline.py run to embed all JSON files from input_dir into db_dir."""
-    pipeline_path = Path(__file__).with_name("pipeline.py")
-    cmd = [
-        sys.executable,
-        str(pipeline_path),
-        "run",
-        "--input_dir",
-        input_dir,
-        "--db_dir",
-        db_dir,
-    ]
-    print(f"  Running: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
+def _strip_accents(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
 
 
-def extract_article_signatures(articles) -> set[str]:
+def _is_blhs_legal_source(raw_value) -> bool:
+    if raw_value is None:
+        return False
+    source = str(raw_value).strip()
+    if not source:
+        return False
+    source_folded = _strip_accents(source).lower()
+    return "blhs" in source_folded or "bo luat hinh su" in source_folded
+
+
+def extract_label_sets_from_verdict(data: dict) -> tuple[dict[str, set[str]], dict[str, int], list[str]]:
     """
-    Given `Cac_Dieu_Quyet_Dinh` which may be a dict { defendant: [ [dieu, khoan, diem], ... ] },
-    collapse into a set of unique string signatures for evaluation.
+    Extract two label spaces from PHAN_QUYET_CUA_TOA_SO_THAM:
+      - dieu_only: {'173', '51', ...}
+      - full_signature: {'173-1', '51-1-s', ...}
+    Returns (label_sets, stats, errors). Any non-empty `errors` means the file
+    should be skipped under strict mode.
     """
-    signatures = set()
-    if isinstance(articles, dict):
-        for val_list in articles.values():
-            if isinstance(val_list, list):
-                for item in val_list:
-                    if isinstance(item, list):
-                        signatures.add("-".join(str(i) for i in item))
-                    else:
-                        signatures.add(str(item))
-            else:
-                signatures.add(str(val_list))
-    elif isinstance(articles, list):
-        for a in articles:
-            if isinstance(a, list):
-                signatures.add("-".join(str(i) for i in a))
-            else:
-                signatures.add(str(a))
-    elif articles:
-        signatures.add(str(articles))
-    return signatures
+    errors: list[str] = []
+    stats = {"n_verdict_items": 0, "n_cancu_items": 0, "n_cancu_blhs_items": 0}
+    label_sets = {"dieu_only": set(), "full_signature": set()}
 
-def load_articles_index(raw_dir: Path) -> dict[str, set[str]]:
+    verdict_items = data.get(VERDICT_FIELD)
+    if not isinstance(verdict_items, list):
+        return label_sets, stats, [f"{VERDICT_FIELD}_invalid_type"]
+    if not verdict_items:
+        return label_sets, stats, [f"{VERDICT_FIELD}_empty"]
+
+    stats["n_verdict_items"] = len(verdict_items)
+    for verdict in verdict_items:
+        if not isinstance(verdict, dict):
+            errors.append("verdict_item_not_object")
+            continue
+
+        legal_basis = verdict.get(LEGAL_BASIS_FIELD)
+        if not isinstance(legal_basis, list):
+            errors.append(f"{LEGAL_BASIS_FIELD}_invalid_type")
+            continue
+        if not legal_basis:
+            errors.append(f"{LEGAL_BASIS_FIELD}_empty")
+            continue
+
+        stats["n_cancu_items"] += len(legal_basis)
+        for basis_item in legal_basis:
+            if not isinstance(basis_item, dict):
+                errors.append("basis_item_not_object")
+                continue
+
+            if not _is_blhs_legal_source(basis_item.get(LEGAL_SOURCE_FIELD)):
+                continue
+
+            stats["n_cancu_blhs_items"] += 1
+
+            dieu_tokens = _split_multi_value(basis_item.get("Dieu"), lowercase=False)
+            khoan_tokens = _split_multi_value(basis_item.get("Khoan"), lowercase=False)
+            diem_tokens = _split_multi_value(basis_item.get("Diem"), lowercase=True)
+
+            if not dieu_tokens:
+                errors.append("missing_dieu")
+                continue
+
+            for dieu in dieu_tokens:
+                label_sets["dieu_only"].add(dieu)
+
+                if khoan_tokens and diem_tokens:
+                    for khoan in khoan_tokens:
+                        for diem in diem_tokens:
+                            label_sets["full_signature"].add(f"{dieu}-{khoan}-{diem}")
+                elif khoan_tokens:
+                    for khoan in khoan_tokens:
+                        label_sets["full_signature"].add(f"{dieu}-{khoan}")
+                elif diem_tokens:
+                    for diem in diem_tokens:
+                        label_sets["full_signature"].add(f"{dieu}-{diem}")
+                else:
+                    label_sets["full_signature"].add(dieu)
+
+    if not label_sets["dieu_only"]:
+        errors.append("no_labels_extracted")
+    return label_sets, stats, errors
+
+
+def load_articles_index(raw_dir: Path) -> tuple[dict[str, dict[str, set[str]]], list[dict]]:
     """
-    Read every raw JSON in raw_dir and build:
-        doc_id -> set of article numbers (Cac_Dieu_Quyet_Dinh)
-    Only includes docs that actually have the field.
+    Build train index:
+      doc_id -> {'dieu_only': set[str], 'full_signature': set[str]}
+    Strict mode: files with parse errors are skipped and reported.
     """
-    index = {}
-    for f in raw_dir.glob("*.json"):
+    index: dict[str, dict[str, set[str]]] = {}
+    skipped: list[dict] = []
+
+    for f in sorted(raw_dir.glob("*.json")):
         with open(f, encoding="utf-8") as fh:
             data = json.load(fh)
-        doc_id   = data.get(ID_FIELD, f.stem)
-        articles = data.get(ARTICLES_FIELD)
-        if articles:
-            index[doc_id] = extract_article_signatures(articles)
-    return index
 
-def load_test_docs(test_dir: Path) -> list[dict]:
+        doc_id = data.get(ID_FIELD, f.stem)
+        label_sets, stats, errors = extract_label_sets_from_verdict(data)
+        if errors:
+            skipped.append({
+                "doc_id": doc_id,
+                "file": f.name,
+                "stage": "train_index",
+                "reasons": sorted(set(errors)),
+                "stats": stats,
+            })
+            continue
+
+        index[doc_id] = label_sets
+
+    return index, skipped
+
+
+def load_test_docs(test_dir: Path, query_fields: list[str] | None = None) -> tuple[list[dict], list[dict]]:
     """
-    Build one record per test document from raw JSON files.
-    Returns list of:
-        {doc_id, query_text, ground_truth_articles}
-    Skips docs without Cac_Dieu_Quyet_Dinh.
+    Build test records:
+      {doc_id, query_text, ground_truth_dieu, ground_truth_full, gt_stats}
+    Strict mode: skip if verdict parse fails or configured query fields produce
+    empty text.
     """
-    test_docs = []
-    skipped = []
+    fields = query_fields or QUERY_CONTENT_FIELDS
+    test_docs: list[dict] = []
+    skipped: list[dict] = []
 
     for f in sorted(test_dir.glob("*.json")):
         with open(f, encoding="utf-8") as fh:
             data = json.load(fh)
 
         doc_id = data.get(ID_FIELD, f.stem)
-        articles = data.get(ARTICLES_FIELD)
-        if not articles:
-            skipped.append(doc_id)
+        label_sets, stats, errors = extract_label_sets_from_verdict(data)
+        if errors:
+            skipped.append({
+                "doc_id": doc_id,
+                "file": f.name,
+                "stage": "test_ground_truth",
+                "reasons": sorted(set(errors)),
+                "stats": stats,
+            })
             continue
 
         parts = []
-        for field in CONTENT_FIELDS:
+        missing_fields = []
+        for field in fields:
             val = (data.get(field) or "").strip()
             if val:
                 parts.append(val)
-        query_text = "\n\n".join(parts)
-        if not query_text.strip():
-            skipped.append(doc_id)
+            else:
+                missing_fields.append(field)
+        query_text = "\n\n".join(parts).strip()
+        if not query_text:
+            skipped.append({
+                "doc_id": doc_id,
+                "file": f.name,
+                "stage": "test_query",
+                "reasons": ["empty_query_text"],
+                "query_fields": fields,
+                "empty_fields": missing_fields,
+            })
             continue
 
         test_docs.append({
-            "doc_id":            doc_id,
-            "query_text":        query_text,
-            "ground_truth":      extract_article_signatures(articles),
+            "doc_id": doc_id,
+            "query_text": query_text,
+            "ground_truth_dieu": label_sets["dieu_only"],
+            "ground_truth_full": label_sets["full_signature"],
+            "gt_stats": stats,
         })
 
-    if skipped:
-        print(f"  [INFO] Skipped {len(skipped)} test doc(s) with missing data: "
-              f"{skipped}")
-    return test_docs
+    return test_docs, skipped
+
+
+def _print_skip_report(skipped: list[dict], title: str) -> None:
+    if not skipped:
+        return
+    print(f"  [INFO] {title}: skipped {len(skipped)} file(s)")
+    for item in skipped[:20]:
+        reasons = ",".join(item.get("reasons", []))
+        print(f"    - {item.get('doc_id')} ({item.get('stage')}): {reasons}")
+    if len(skipped) > 20:
+        print(f"    ... and {len(skipped) - 20} more")
 
 # Metrics
 def precision_recall_f1(predicted: set[str], ground_truth: set[str]) -> tuple[float, float, float]:
@@ -186,38 +286,71 @@ def evaluate(
     top_k: int,
     results_out: str,
     skip_embedding: bool,
+    train_embedding_fields: list[str] | None = None,
+    test_embedding_fields: list[str] | None = None,
+    query_content_fields: list[str] | None = None,
+    model_name: str = DEFAULT_MODEL_NAME,
+    device: str = DEFAULT_DEVICE,
+    max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    collection_name: str = DEFAULT_COLLECTION_NAME,
 ) -> None:
+
+    train_fields = train_embedding_fields or TRAIN_EMBED_CONTENT_FIELDS
+    test_fields = test_embedding_fields or TEST_EMBED_CONTENT_FIELDS
+    query_fields = query_content_fields or QUERY_CONTENT_FIELDS
+    print(f"  Train embedding fields: {train_fields}")
+    print(f"  Test  embedding fields: {test_fields}")
+    print(f"  Query content fields  : {query_fields}")
 
     train_path = Path(train_dir)
     test_path = Path(test_dir)
 
     if not skip_embedding:
         print("\n── Step 1: Embed train folder ───────────────────────────")
-        run_pipeline_embedding(train_dir, train_db_dir)
+        run_pipeline(
+            train_dir, train_db_dir,
+            content_fields=train_fields,
+            model_name=model_name,
+            device=device,
+            max_chunk_chars=max_chunk_chars,
+            batch_size=batch_size,
+            collection_name=collection_name,
+        )
 
         print("\n── Step 2: Embed test folder ────────────────────────────")
-        run_pipeline_embedding(test_dir, test_db_dir)
+        run_pipeline(
+            test_dir, test_db_dir,
+            content_fields=test_fields,
+            model_name=model_name,
+            device=device,
+            max_chunk_chars=max_chunk_chars,
+            batch_size=batch_size,
+            collection_name=collection_name,
+        )
     else:
         print("\n── Step 1: Skipping embedding (--skip_embedding) ───────")
 
     print("\n── Step 3: Load model ───────────────────────────────────")
-    model = load_model()
+    model = load_model(model_name=model_name, device=device)
 
     print("\n── Step 4: Load train ChromaDB ──────────────────────────")
-    collection = load_chroma(train_db_dir)
+    collection = load_chroma(train_db_dir, collection_name=collection_name, create=False)
     print(f"  Train collection has {collection.count()} documents")
 
     print("\n── Step 5: Load test documents ──────────────────────────")
-    test_docs = load_test_docs(test_path)
-    print(f"  {len(test_docs)} test doc(s) with ground-truth articles")
+    test_docs, test_skipped = load_test_docs(test_path, query_fields=query_fields)
+    _print_skip_report(test_skipped, "Test loading")
+    print(f"  {len(test_docs)} evaluable test doc(s)")
 
     if not test_docs:
         print("\n  [WARN] No evaluable test documents found.")
-        print(f"  Make sure test_dir files contain '{ARTICLES_FIELD}' and query text fields.")
+        print(f"  Check '{VERDICT_FIELD}' and configured query fields.")
         return
 
-    # Build train doc_id -> articles lookup to resolve retrieved chunk owners.
-    train_articles_index = load_articles_index(train_path)
+    # Build train doc_id -> labels lookup to resolve retrieved chunk owners.
+    train_articles_index, train_skipped = load_articles_index(train_path)
+    _print_skip_report(train_skipped, "Train label index")
 
     print(f"\n── Step 6: Query + evaluate (top_k={top_k}) ─────────────")
     per_doc_results = []
@@ -225,7 +358,8 @@ def evaluate(
     for doc in test_docs:
         doc_id      = doc["doc_id"]
         query_text  = doc["query_text"]
-        ground_truth = doc["ground_truth"]
+        ground_truth_dieu = doc["ground_truth_dieu"]
+        ground_truth_full = doc["ground_truth_full"]
 
         # Embed the query
         vec = model.encode([query_text], normalize_embeddings=True).tolist()
@@ -247,38 +381,57 @@ def evaluate(
                 seen.add(rid)
                 retrieved_doc_ids.append(rid)
 
-        # Union of articles across all retrieved documents
+        # Union of labels across all retrieved documents
         predicted_articles: set[str] = set()
+        predicted_full: set[str] = set()
         for rid in retrieved_doc_ids:
-            predicted_articles |= train_articles_index.get(rid, set())
+            labels = train_articles_index.get(rid)
+            if not labels:
+                continue
+            predicted_articles |= labels["dieu_only"]
+            predicted_full |= labels["full_signature"]
 
-        p, r, f1 = precision_recall_f1(predicted_articles, ground_truth)
+        p_dieu, r_dieu, f1_dieu = precision_recall_f1(predicted_articles, ground_truth_dieu)
+        p_full, r_full, f1_full = precision_recall_f1(predicted_full, ground_truth_full)
 
         result = {
             "doc_id":              doc_id,
-            "ground_truth":        sorted(ground_truth),
+            "ground_truth":        sorted(ground_truth_full),
+            "ground_truth_dieu":   sorted(ground_truth_dieu),
             "retrieved_doc_ids":   retrieved_doc_ids,
-            "predicted_articles":  sorted(predicted_articles),
-            "matched_articles":    sorted(predicted_articles & ground_truth),
-            "missed_articles":     sorted(ground_truth - predicted_articles),
-            "extra_articles":      sorted(predicted_articles - ground_truth),
-            "precision":           round(p,  4),
-            "recall":              round(r,  4),
-            "f1":                  round(f1, 4),
+            "predicted_articles":  sorted(predicted_full),
+            "predicted_articles_dieu": sorted(predicted_articles),
+            "matched_articles":    sorted(predicted_full & ground_truth_full),
+            "missed_articles":     sorted(ground_truth_full - predicted_full),
+            "extra_articles":      sorted(predicted_full - ground_truth_full),
+            "matched_articles_dieu": sorted(predicted_articles & ground_truth_dieu),
+            "missed_articles_dieu": sorted(ground_truth_dieu - predicted_articles),
+            "extra_articles_dieu": sorted(predicted_articles - ground_truth_dieu),
+            "precision":           round(p_full, 4),
+            "recall":              round(r_full, 4),
+            "f1":                  round(f1_full, 4),
+            "precision_dieu":      round(p_dieu,  4),
+            "recall_dieu":         round(r_dieu,  4),
+            "f1_dieu":             round(f1_dieu, 4),
+            "gt_stats":            doc["gt_stats"],
         }
         per_doc_results.append(result)
 
         print(f"\n  doc: {doc_id}")
-        print(f"    ground truth : {sorted(ground_truth)}")
-        print(f"    predicted    : {sorted(predicted_articles)}")
-        print(f"    matched      : {sorted(predicted_articles & ground_truth)}")
-        print(f"    P={p:.4f}  R={r:.4f}  F1={f1:.4f}")
+        print(f"    ground truth (full_signature): {sorted(ground_truth_full)}")
+        print(f"    predicted              : {sorted(predicted_full)}")
+        print(f"    matched                : {sorted(predicted_full & ground_truth_full)}")
+        print(f"    P={p_full:.4f}  R={r_full:.4f}  F1={f1_full:.4f}")
+        print(f"    DIEU P={p_dieu:.4f}  R={r_dieu:.4f}  F1={f1_dieu:.4f}")
 
     # Macro-average
     n = len(per_doc_results)
     macro_p  = sum(r["precision"] for r in per_doc_results) / n
     macro_r  = sum(r["recall"]    for r in per_doc_results) / n
     macro_f1 = sum(r["f1"]        for r in per_doc_results) / n
+    macro_p_dieu = sum(r["precision_dieu"] for r in per_doc_results) / n
+    macro_r_dieu = sum(r["recall_dieu"] for r in per_doc_results) / n
+    macro_f1_dieu = sum(r["f1_dieu"] for r in per_doc_results) / n
 
     print("\n── Results ──────────────────────────────────────────────")
     print(f"  Evaluated on : {n} test document(s)")
@@ -286,6 +439,9 @@ def evaluate(
     print(f"  Macro P      : {macro_p:.4f}")
     print(f"  Macro R      : {macro_r:.4f}")
     print(f"  Macro F1     : {macro_f1:.4f}")
+    print(f"  Macro P(dieu): {macro_p_dieu:.4f}")
+    print(f"  Macro R(dieu): {macro_r_dieu:.4f}")
+    print(f"  Macro F1(dieu): {macro_f1_dieu:.4f}")
 
     # Save results
     output = {
@@ -294,10 +450,23 @@ def evaluate(
         "train_db_dir": train_db_dir,
         "test_db_dir": test_db_dir,
         "top_k":     top_k,
+        "model_name": model_name,
+        "collection_name": collection_name,
+        "max_chunk_chars": max_chunk_chars,
+        "train_embedding_fields": train_fields,
+        "test_embedding_fields": test_fields,
+        "query_content_fields": query_fields,
         "n_docs":    n,
         "macro_precision": round(macro_p,  4),
         "macro_recall":    round(macro_r,  4),
         "macro_f1":        round(macro_f1, 4),
+        "macro_precision_dieu": round(macro_p_dieu, 4),
+        "macro_recall_dieu": round(macro_r_dieu, 4),
+        "macro_f1_dieu": round(macro_f1_dieu, 4),
+        "n_train_skipped": len(train_skipped),
+        "n_test_skipped": len(test_skipped),
+        "train_skipped": train_skipped,
+        "test_skipped": test_skipped,
         "per_doc":         per_doc_results,
     }
     out_path = Path(results_out)
@@ -315,7 +484,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Embed train/test folders into separate DBs and evaluate retrieval "
-            "quality using Cac_Dieu_Quyet_Dinh overlap"
+            "quality using PHAN_QUYET_CUA_TOA_SO_THAM overlap"
         )
     )
     parser.add_argument(
@@ -341,7 +510,7 @@ def main():
     parser.add_argument(
         "--top_k",
         type=int,
-        default=10,
+        default=5,
         help="Number of chunks to retrieve per query (default: 10)",
     )
     parser.add_argument(
@@ -352,9 +521,60 @@ def main():
     parser.add_argument(
         "--skip_embedding",
         action="store_true",
-        help="Skip running pipeline.py embedding and evaluate using existing DBs",
+        help="Skip embedding and evaluate using existing DBs",
+    )
+    parser.add_argument(
+        "--train_embedding_fields",
+        default=None,
+        help="Comma-separated list of JSON fields to chunk & embed for train "
+             f"(default: {','.join(TRAIN_EMBED_CONTENT_FIELDS)})",
+    )
+    parser.add_argument(
+        "--test_embedding_fields",
+        default=None,
+        help="Comma-separated list of JSON fields to chunk & embed for test "
+             f"(default: {','.join(TEST_EMBED_CONTENT_FIELDS)})",
+    )
+    parser.add_argument(
+        "--query_content_fields",
+        default=None,
+        help="Comma-separated list of JSON fields used to build query text "
+             f"(default: {','.join(QUERY_CONTENT_FIELDS)})",
+    )
+    # Embedding / chunking parameters
+    parser.add_argument(
+        "--model_name",
+        default=DEFAULT_MODEL_NAME,
+        help=f"SentenceTransformer model name (default: {DEFAULT_MODEL_NAME})",
+    )
+    parser.add_argument(
+        "--device",
+        default=DEFAULT_DEVICE,
+        help=f"Device for model inference (default: {DEFAULT_DEVICE})",
+    )
+    parser.add_argument(
+        "--max_chunk_chars",
+        type=int,
+        default=DEFAULT_MAX_CHUNK_CHARS,
+        help=f"Max characters per chunk; 0 = no splitting (default: {DEFAULT_MAX_CHUNK_CHARS})",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Embedding batch size (default: {DEFAULT_BATCH_SIZE})",
+    )
+    parser.add_argument(
+        "--collection_name",
+        default=DEFAULT_COLLECTION_NAME,
+        help=f"ChromaDB collection name (default: {DEFAULT_COLLECTION_NAME})",
     )
     args = parser.parse_args()
+
+    train_fields = [f.strip() for f in args.train_embedding_fields.split(",")] if args.train_embedding_fields else None
+    test_fields = [f.strip() for f in args.test_embedding_fields.split(",")] if args.test_embedding_fields else None
+    query_fields = [f.strip() for f in args.query_content_fields.split(",")] if args.query_content_fields else None
+
     evaluate(
         args.train_dir,
         args.test_dir,
@@ -363,6 +583,14 @@ def main():
         args.top_k,
         args.results_out,
         args.skip_embedding,
+        train_embedding_fields=train_fields,
+        test_embedding_fields=test_fields,
+        query_content_fields=query_fields,
+        model_name=args.model_name,
+        device=args.device,
+        max_chunk_chars=args.max_chunk_chars,
+        batch_size=args.batch_size,
+        collection_name=args.collection_name,
     )
 
 
