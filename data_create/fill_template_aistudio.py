@@ -7,8 +7,8 @@ from typing import List, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
-import google.generativeai as genai
-from google.generativeai.types import GenerationConfig
+import google.genai as genai
+from google.genai import types
 
 # ==========================================
 # 0. MODEL & PRICING CONFIGURATION
@@ -18,22 +18,21 @@ INPUT_PRICE_PER_1M_USD  = 0.0   # Free tier on AI Studio
 OUTPUT_PRICE_PER_1M_USD = 0.0   # Free tier on AI Studio
  
 # Lazy-initialised client handle
-_genai_model = None
+_genai_client = None
  
  
 def get_model():
-    """Lazily configure the genai library and return a GenerativeModel instance."""
-    global _genai_model
-    if _genai_model is None:
+    """Lazily initialize and return a Google GenAI client."""
+    global _genai_client
+    if _genai_client is None:
         api_key = os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             raise EnvironmentError(
                 "GOOGLE_API_KEY environment variable is not set. "
                 "Get one at https://aistudio.google.com/app/apikey"
             )
-        genai.configure(api_key=api_key)
-        _genai_model = genai.GenerativeModel(model_name=MODEL_NAME)
-    return _genai_model
+        _genai_client = genai.Client(api_key=api_key)
+    return _genai_client
 
 # ==========================================
 # 1. PYDANTIC SCHEMAS FOR LLM EXTRACTION
@@ -233,7 +232,7 @@ def parse_llm_json(response_text: str, schema: type) -> BaseModel:
  
  
 def call_model(
-    model,
+    client,
     system_prompt: str,
     user_content: str,
     schema: type,
@@ -248,11 +247,11 @@ def call_model(
     as a safety net.
     """
     # Merge system prompt into the user turn because Gemma instruction-tuned
-    # models on AI Studio may not honour a separate system instruction via the
-    # GenerativeModel API; prepending it is the most reliable approach.
+    # models on AI Studio may not honour a separate system instruction; prepending
+    # it is the most reliable approach.
     full_prompt = f"{system_prompt.strip()}\n\n{user_content.strip()}"
  
-    generation_config = GenerationConfig(
+    generation_config = types.GenerateContentConfig(
         temperature=0.0,
         response_mime_type="application/json",
         # Pass a sanitized plain dict — NOT the raw Pydantic class — to avoid
@@ -260,9 +259,10 @@ def call_model(
         response_schema=get_response_schema(schema),
     )
  
-    response = model.generate_content(
-        full_prompt,
-        generation_config=generation_config,
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=full_prompt,
+        config=generation_config,
     )
  
     # Extract token usage (metadata may be absent on free tier / some model versions)
@@ -453,7 +453,7 @@ JSON SCHEMA:
         # ------------------------------------------------------------------
         stage3_data["_usage"] = {
             "model": MODEL_NAME,
-            "api":   "Google AI Studio (google-generativeai)",
+            "api":   "Google AI Studio (google-genai)",
             "pricing": {
                 "input_per_1m_usd":  INPUT_PRICE_PER_1M_USD,
                 "output_per_1m_usd": OUTPUT_PRICE_PER_1M_USD,

@@ -6,3 +6,13 @@
 .env
 *.env
 
+# Generated retrieval/vector DB artifacts
+output/chroma_db_*/
+output/generation_eval/*_db/
+output/**/chroma.sqlite3
+output/**/index_metadata.pickle
+output/**/data_level0.bin
+output/**/header.bin
+output/**/length.bin
+output/**/link_lists.bin
+

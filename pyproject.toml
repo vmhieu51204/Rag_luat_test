@@ -5,9 +5,22 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "chromadb>=0.6.0",
+    "google-genai>=1.0.0",
     "ipykernel>=7.2.0",
     "openai>=2.30.0",
     "pydantic>=2.12.5",
     "python-dotenv>=1.2.2",
     "requests>=2.33.1",
+    "scipy>=1.14.0",
+    "sentence-transformers>=3.0.0",
 ]
+
+[project.scripts]
+rag-embed = "rag.core.embeddings:main"
+rag-law-retrieve = "rag.core.law_retriever:main"
+rag-evaluate = "rag.evaluation.retrieval_eval:main"
+rag-evaluate-law-models = "rag.evaluation.law_embedding_model_eval:main"
+rag-optimize-case-only = "rag.evaluation.case_only_embedding_optimizer:main"
+rag-evaluate-generation = "rag.evaluation.generation_eval:main"
+rag-generate-verdict = "rag.generation.verdict_from_eval:main"

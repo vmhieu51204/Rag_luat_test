@@ -503,7 +503,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--top_k",
         type=int,
-        default=10,
+        default=15,
         help="Maximum number of train cases to select per test case",
     )
     parser.add_argument(

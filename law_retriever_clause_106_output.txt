@@ -1,0 +1,14 @@
+query=106
+found=True level=dieu reason=None
+normalized=106
+result_json:
+{
+  "query": "106",
+  "normalized": "106",
+  "found": true,
+  "level": "dieu",
+  "text": "[dieu 106] Tha tù trước hạn có điều kiện\n[khoan 1] Người dưới 18 tuổi đang chấp hành án phạt tù, nếu không thuộc các trường hợp quy định tại khoản 2 Điều 66 của Bộ luật này có thể được tha tù trước hạn khi có đủ các điều kiện sau đây:\n[diem a] Phạm tội lần đầu;\n[diem b] Có nhiều tiến bộ, có ý thức cải tạo tốt;\n[diem c] Đã chấp hành được một phần ba thời hạn phạt tù;\n[diem d] Có nơi cư trú rõ ràng.\n[khoan 2] Việc tha tù trước thời hạn có điều kiện được thực hiện theo quy định tại các khoản 3, 4 và 5 Điều 66 của Bộ luật này.",
+  "dieu": "106",
+  "khoan": null,
+  "diem": null
+}

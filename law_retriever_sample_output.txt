@@ -1,0 +1,90 @@
+query=3
+found=True level=dieu reason=None
+normalized=3
+text:
+Nguyên tắc xử lý
+Đối với người phạm tội:
+Mọi hành vi phạm tội do người thực hiện phải được phát hiện kịp thời, xử lý nhanh chóng, công minh theo đúng pháp luật;
+Mọi người phạm tội đều bình đẳng trước pháp luật, không phân biệt giới tính, dân tộc, tín ngưỡng, tôn giáo, thành phần, địa vị xã hội;
+Nghiêm trị người chủ mưu, cầm đầu, chỉ huy, ngoan cố chống đối, côn đồ, tái phạm nguy hiểm, lợi dụng chức vụ, quyền hạn để phạm tội;
+Nghiêm trị người phạm tội dùng thủ đoạn xảo quyệt, có tổ chức, có tính chất chuyên nghiệp, cố ý gây hậu quả đặc biệt nghiêm trọng.
+Khoan hồng đối với người tự thú, đầu thú, thành khẩn khai báo, tố giác đồng phạm, lập công chuộc tội, tích cực hợp tác với cơ quan có trách nhiệm trong việc phát hiện tội phạm hoặc trong quá trình giải quyết vụ án, ăn năn hối cải, tự nguyện sửa chữa hoặc bồi thường thiệt hại gây ra;
+Đối với người lần đầu phạm tội ít nghiêm trọng, thì có thể áp dụng hình phạt nhẹ hơn hình phạt tù, giao họ cho cơ quan, tổ chức hoặc gia đình giám sát, giáo dục;
+Đối với người bị phạt tù thì buộc họ phải chấp hành hình phạt tại các cơ sở giam giữ, phải lao động, học tập để trở thành người có ích cho xã hội; nếu họ có đủ điều kiện do Bộ luật này quy định, thì có thể được xét giảm thời hạn chấp hành hình phạt, tha tù trước thời hạn có điều kiện;
+Người đã chấp hành xong hình phạt được tạo điều kiện làm ăn, sinh sống lương thiện, hòa nhập với cộng đồng, khi có đủ điều kiện do luật định thì được xóa án tích.
+Đối với pháp nhân thương mại phạm tội:
+Mọi hành vi phạm tội do pháp nhân thương mại thực hiện phải được phát hiện kịp thời, xử lý nhanh chóng, công minh theo đúng pháp luật;
+Mọi pháp nhân thương mại phạm tội đều bình đẳng trước pháp luật, không phân biệt hình thức sở hữu và thành phần kinh tế;
+Nghiêm trị pháp nhân thương mại phạm tội dùng thủ đoạn tinh vi, có tính chất chuyên nghiệp, cố ý gây hậu quả đặc biệt nghiêm trọng;
+Khoan hồng đối với pháp nhân thương mại tích cực hợp tác với cơ quan có trách nhiệm trong việc phát hiện tội phạm hoặc trong quá trình giải quyết vụ án, tự nguyện sửa chữa, bồi thường thiệt hại gây ra, chủ động ngăn chặn hoặc khắc phục hậu quả xảy ra.
+----------------------------------------------------------------------------------------------------
+query=3-1
+found=True level=khoan reason=None
+normalized=3-1
+text:
+Nguyên tắc xử lý
+Đối với người phạm tội:
+Mọi hành vi phạm tội do người thực hiện phải được phát hiện kịp thời, xử lý nhanh chóng, công minh theo đúng pháp luật;
+Mọi người phạm tội đều bình đẳng trước pháp luật, không phân biệt giới tính, dân tộc, tín ngưỡng, tôn giáo, thành phần, địa vị xã hội;
+Nghiêm trị người chủ mưu, cầm đầu, chỉ huy, ngoan cố chống đối, côn đồ, tái phạm nguy hiểm, lợi dụng chức vụ, quyền hạn để phạm tội;
+Nghiêm trị người phạm tội dùng thủ đoạn xảo quyệt, có tổ chức, có tính chất chuyên nghiệp, cố ý gây hậu quả đặc biệt nghiêm trọng.
+Khoan hồng đối với người tự thú, đầu thú, thành khẩn khai báo, tố giác đồng phạm, lập công chuộc tội, tích cực hợp tác với cơ quan có trách nhiệm trong việc phát hiện tội phạm hoặc trong quá trình giải quyết vụ án, ăn năn hối cải, tự nguyện sửa chữa hoặc bồi thường thiệt hại gây ra;
+Đối với người lần đầu phạm tội ít nghiêm trọng, thì có thể áp dụng hình phạt nhẹ hơn hình phạt tù, giao họ cho cơ quan, tổ chức hoặc gia đình giám sát, giáo dục;
+Đối với người bị phạt tù thì buộc họ phải chấp hành hình phạt tại các cơ sở giam giữ, phải lao động, học tập để trở thành người có ích cho xã hội; nếu họ có đủ điều kiện do Bộ luật này quy định, thì có thể được xét giảm thời hạn chấp hành hình phạt, tha tù trước thời hạn có điều kiện;
+Người đã chấp hành xong hình phạt được tạo điều kiện làm ăn, sinh sống lương thiện, hòa nhập với cộng đồng, khi có đủ điều kiện do luật định thì được xóa án tích.
+----------------------------------------------------------------------------------------------------
+query=3-1-đ
+found=True level=diem reason=None
+normalized=3-1-đ
+text:
+Nguyên tắc xử lý
+Đối với người phạm tội:
+Đối với người lần đầu phạm tội ít nghiêm trọng, thì có thể áp dụng hình phạt nhẹ hơn hình phạt tù, giao họ cho cơ quan, tổ chức hoặc gia đình giám sát, giáo dục;
+----------------------------------------------------------------------------------------------------
+query=3-1-d
+found=True level=diem reason=None
+normalized=3-1-d
+text:
+Nguyên tắc xử lý
+Đối với người phạm tội:
+Nghiêm trị người phạm tội dùng thủ đoạn xảo quyệt, có tổ chức, có tính chất chuyên nghiệp, cố ý gây hậu quả đặc biệt nghiêm trọng.
+Khoan hồng đối với người tự thú, đầu thú, thành khẩn khai báo, tố giác đồng phạm, lập công chuộc tội, tích cực hợp tác với cơ quan có trách nhiệm trong việc phát hiện tội phạm hoặc trong quá trình giải quyết vụ án, ăn năn hối cải, tự nguyện sửa chữa hoặc bồi thường thiệt hại gây ra;
+----------------------------------------------------------------------------------------------------
+query=2-2
+found=True level=khoan reason=None
+normalized=2-2
+text:
+Cơ sở của trách nhiệm hình sự
+Chỉ pháp nhân thương mại nào phạm một tội đã được quy định tại Điều 76 của Bộ luật này mới phải chịu trách nhiệm hình sự.
+----------------------------------------------------------------------------------------------------
+query=89
+found=True level=dieu reason=None
+normalized=89
+text:
+Xóa án tích
+Pháp nhân thương mại bị kết án đương nhiên được xóa án tích nếu trong thời hạn 02 năm kể từ khi chấp hành xong hình phạt chính, hình phạt bổ sung, các quyết định khác của bản án hoặc từ khi hết thời hiệu thi hành bản án mà pháp nhân thương mại không thực hiện hành vi phạm tội mới.
+----------------------------------------------------------------------------------------------------
+query=89-2
+found=False level=None reason=khoan_not_found
+normalized=89-2
+text:
+
+----------------------------------------------------------------------------------------------------
+query=999
+found=False level=None reason=dieu_not_found
+normalized=999
+text:
+
+----------------------------------------------------------------------------------------------------
+query=3-99
+found=False level=None reason=khoan_not_found
+normalized=3-99
+text:
+
+----------------------------------------------------------------------------------------------------
+query=3-1-z
+found=False level=None reason=diem_not_found
+normalized=3-1-z
+text:
+
+----------------------------------------------------------------------------------------------------

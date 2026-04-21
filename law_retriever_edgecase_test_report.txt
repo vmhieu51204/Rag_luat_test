@@ -1,0 +1,230 @@
+LAW RETRIEVER EDGECASE TEST REPORT (FULL, NO TRUNCATION)
+{"total": 30, "found": 18, "not_found": 7, "invalid": 5}
+========================================================================================================================
+case=dieu_only_plain
+query='106'
+found=True level=dieu reason=None normalized=106
+text_full:
+[dieu 106] Tha tù trước hạn có điều kiện
+[khoan 1] Người dưới 18 tuổi đang chấp hành án phạt tù, nếu không thuộc các trường hợp quy định tại khoản 2 Điều 66 của Bộ luật này có thể được tha tù trước hạn khi có đủ các điều kiện sau đây:
+[diem a] Phạm tội lần đầu;
+[diem b] Có nhiều tiến bộ, có ý thức cải tạo tốt;
+[diem c] Đã chấp hành được một phần ba thời hạn phạt tù;
+[diem d] Có nơi cư trú rõ ràng.
+[khoan 2] Việc tha tù trước thời hạn có điều kiện được thực hiện theo quy định tại các khoản 3, 4 và 5 Điều 66 của Bộ luật này.
+------------------------------------------------------------------------------------------------------------------------
+case=khoan_plain
+query='106-1'
+found=True level=khoan reason=None normalized=106-1
+text_full:
+[dieu 106] Tha tù trước hạn có điều kiện
+[khoan 1] Người dưới 18 tuổi đang chấp hành án phạt tù, nếu không thuộc các trường hợp quy định tại khoản 2 Điều 66 của Bộ luật này có thể được tha tù trước hạn khi có đủ các điều kiện sau đây:
+[diem a] Phạm tội lần đầu;
+[diem b] Có nhiều tiến bộ, có ý thức cải tạo tốt;
+[diem c] Đã chấp hành được một phần ba thời hạn phạt tù;
+[diem d] Có nơi cư trú rõ ràng.
+------------------------------------------------------------------------------------------------------------------------
+case=diem_plain_a
+query='106-1-a'
+found=True level=diem reason=None normalized=106-1-a
+text_full:
+[dieu 106] Tha tù trước hạn có điều kiện
+[khoan 1] Người dưới 18 tuổi đang chấp hành án phạt tù, nếu không thuộc các trường hợp quy định tại khoản 2 Điều 66 của Bộ luật này có thể được tha tù trước hạn khi có đủ các điều kiện sau đây:
+[diem a] Phạm tội lần đầu;
+------------------------------------------------------------------------------------------------------------------------
+case=diem_plain_d
+query='106-1-d'
+found=True level=diem reason=None normalized=106-1-d
+text_full:
+[dieu 106] Tha tù trước hạn có điều kiện
+[khoan 1] Người dưới 18 tuổi đang chấp hành án phạt tù, nếu không thuộc các trường hợp quy định tại khoản 2 Điều 66 của Bộ luật này có thể được tha tù trước hạn khi có đủ các điều kiện sau đây:
+[diem d] Có nơi cư trú rõ ràng.
+------------------------------------------------------------------------------------------------------------------------
+case=diem_plain_dd
+query='106-1-đ'
+found=False level=None reason=diem_not_found normalized=106-1-đ
+text_full:
+
+------------------------------------------------------------------------------------------------------------------------
+case=full_label_ascii
+query='Dieu 106, khoan 1, diem a'
+found=True level=diem reason=None normalized=106-1-a
+text_full:
+[dieu 106] Tha tù trước hạn có điều kiện
+[khoan 1] Người dưới 18 tuổi đang chấp hành án phạt tù, nếu không thuộc các trường hợp quy định tại khoản 2 Điều 66 của Bộ luật này có thể được tha tù trước hạn khi có đủ các điều kiện sau đây:
+[diem a] Phạm tội lần đầu;
+------------------------------------------------------------------------------------------------------------------------
+case=full_label_vn_dieu
+query='Điều 106, khoản 1, điểm a'
+found=True level=diem reason=None normalized=106-1-a
+text_full:
+[dieu 106] Tha tù trước hạn có điều kiện
+[khoan 1] Người dưới 18 tuổi đang chấp hành án phạt tù, nếu không thuộc các trường hợp quy định tại khoản 2 Điều 66 của Bộ luật này có thể được tha tù trước hạn khi có đủ các điều kiện sau đây:
+[diem a] Phạm tội lần đầu;
+------------------------------------------------------------------------------------------------------------------------
+case=full_label_vn_ddieu
+query='ĐIỀU 106, KHOẢN 1, ĐIỂM a'
+found=True level=diem reason=None normalized=106-1-a
+text_full:
+[dieu 106] Tha tù trước hạn có điều kiện
+[khoan 1] Người dưới 18 tuổi đang chấp hành án phạt tù, nếu không thuộc các trường hợp quy định tại khoản 2 Điều 66 của Bộ luật này có thể được tha tù trước hạn khi có đủ các điều kiện sau đây:
+[diem a] Phạm tội lần đầu;
+------------------------------------------------------------------------------------------------------------------------
+case=mixed_case_spaces
+query='  Dieu   106   -   Khoan 1   -   Diem   a   '
+found=True level=diem reason=None normalized=106-1-a
+text_full:
+[dieu 106] Tha tù trước hạn có điều kiện
+[khoan 1] Người dưới 18 tuổi đang chấp hành án phạt tù, nếu không thuộc các trường hợp quy định tại khoản 2 Điều 66 của Bộ luật này có thể được tha tù trước hạn khi có đủ các điều kiện sau đây:
+[diem a] Phạm tội lần đầu;
+------------------------------------------------------------------------------------------------------------------------
+case=word_without_commas
+query='dieu 106 khoan 1 diem b'
+found=True level=diem reason=None normalized=106-1-b
+text_full:
+[dieu 106] Tha tù trước hạn có điều kiện
+[khoan 1] Người dưới 18 tuổi đang chấp hành án phạt tù, nếu không thuộc các trường hợp quy định tại khoản 2 Điều 66 của Bộ luật này có thể được tha tù trước hạn khi có đủ các điều kiện sau đây:
+[diem b] Có nhiều tiến bộ, có ý thức cải tạo tốt;
+------------------------------------------------------------------------------------------------------------------------
+case=slash_separator
+query='106/1/a'
+found=True level=diem reason=None normalized=106-1-a
+text_full:
+[dieu 106] Tha tù trước hạn có điều kiện
+[khoan 1] Người dưới 18 tuổi đang chấp hành án phạt tù, nếu không thuộc các trường hợp quy định tại khoản 2 Điều 66 của Bộ luật này có thể được tha tù trước hạn khi có đủ các điều kiện sau đây:
+[diem a] Phạm tội lần đầu;
+------------------------------------------------------------------------------------------------------------------------
+case=dot_separator
+query='106.1.a'
+found=True level=diem reason=None normalized=106-1-a
+text_full:
+[dieu 106] Tha tù trước hạn có điều kiện
+[khoan 1] Người dưới 18 tuổi đang chấp hành án phạt tù, nếu không thuộc các trường hợp quy định tại khoản 2 Điều 66 của Bộ luật này có thể được tha tù trước hạn khi có đủ các điều kiện sau đây:
+[diem a] Phạm tội lần đầu;
+------------------------------------------------------------------------------------------------------------------------
+case=comma_separator
+query='106,1,a'
+found=True level=diem reason=None normalized=106-1-a
+text_full:
+[dieu 106] Tha tù trước hạn có điều kiện
+[khoan 1] Người dưới 18 tuổi đang chấp hành án phạt tù, nếu không thuộc các trường hợp quy định tại khoản 2 Điều 66 của Bộ luật này có thể được tha tù trước hạn khi có đủ các điều kiện sau đây:
+[diem a] Phạm tội lần đầu;
+------------------------------------------------------------------------------------------------------------------------
+case=underscore_separator
+query='106_1_a'
+found=True level=diem reason=None normalized=106-1-a
+text_full:
+[dieu 106] Tha tù trước hạn có điều kiện
+[khoan 1] Người dưới 18 tuổi đang chấp hành án phạt tù, nếu không thuộc các trường hợp quy định tại khoản 2 Điều 66 của Bộ luật này có thể được tha tù trước hạn khi có đủ các điều kiện sau đây:
+[diem a] Phạm tội lần đầu;
+------------------------------------------------------------------------------------------------------------------------
+case=extra_symbols
+query='***106@@@1###a$$$'
+found=True level=diem reason=None normalized=106-1-a
+text_full:
+[dieu 106] Tha tù trước hạn có điều kiện
+[khoan 1] Người dưới 18 tuổi đang chấp hành án phạt tù, nếu không thuộc các trường hợp quy định tại khoản 2 Điều 66 của Bộ luật này có thể được tha tù trước hạn khi có đủ các điều kiện sau đây:
+[diem a] Phạm tội lần đầu;
+------------------------------------------------------------------------------------------------------------------------
+case=leading_zeros
+query='0106-01-a'
+found=False level=None reason=dieu_not_found normalized=0106-01-a
+text_full:
+
+------------------------------------------------------------------------------------------------------------------------
+case=int_input
+query=106
+found=True level=dieu reason=None normalized=106
+text_full:
+[dieu 106] Tha tù trước hạn có điều kiện
+[khoan 1] Người dưới 18 tuổi đang chấp hành án phạt tù, nếu không thuộc các trường hợp quy định tại khoản 2 Điều 66 của Bộ luật này có thể được tha tù trước hạn khi có đủ các điều kiện sau đây:
+[diem a] Phạm tội lần đầu;
+[diem b] Có nhiều tiến bộ, có ý thức cải tạo tốt;
+[diem c] Đã chấp hành được một phần ba thời hạn phạt tù;
+[diem d] Có nơi cư trú rõ ràng.
+[khoan 2] Việc tha tù trước thời hạn có điều kiện được thực hiện theo quy định tại các khoản 3, 4 và 5 Điều 66 của Bộ luật này.
+------------------------------------------------------------------------------------------------------------------------
+case=none_input
+query=None
+found=False level=None reason=signature is None normalized=None
+text_full:
+
+------------------------------------------------------------------------------------------------------------------------
+case=empty_string
+query=''
+found=False level=None reason=signature is empty normalized=None
+text_full:
+
+------------------------------------------------------------------------------------------------------------------------
+case=only_label
+query='dieu'
+found=False level=None reason=invalid signature: 'dieu' normalized=None
+text_full:
+
+------------------------------------------------------------------------------------------------------------------------
+case=non_digit_dieu
+query='abc-1-a'
+found=False level=None reason=invalid dieu in signature: 'abc-1-a' normalized=None
+text_full:
+
+------------------------------------------------------------------------------------------------------------------------
+case=too_many_parts
+query='106-1-a-extra'
+found=False level=None reason=too many parts in signature: '106-1-a-extra' normalized=None
+text_full:
+
+------------------------------------------------------------------------------------------------------------------------
+case=dieu_not_found
+query='999'
+found=False level=None reason=dieu_not_found normalized=999
+text_full:
+
+------------------------------------------------------------------------------------------------------------------------
+case=khoan_not_found
+query='106-99'
+found=False level=None reason=khoan_not_found normalized=106-99
+text_full:
+
+------------------------------------------------------------------------------------------------------------------------
+case=diem_not_found
+query='106-1-z'
+found=False level=None reason=diem_not_found normalized=106-1-z
+text_full:
+
+------------------------------------------------------------------------------------------------------------------------
+case=reversed_order_semantic
+query='khoan 1 dieu 106'
+found=False level=None reason=khoan_not_found normalized=1-106
+text_full:
+
+------------------------------------------------------------------------------------------------------------------------
+case=d_vs_dd_distinct_d
+query='3-1-d'
+found=True level=diem reason=None normalized=3-1-d
+text_full:
+[dieu 3] Nguyên tắc xử lý
+[khoan 1] Đối với người phạm tội:
+[diem d] Nghiêm trị người phạm tội dùng thủ đoạn xảo quyệt, có tổ chức, có tính chất chuyên nghiệp, cố ý gây hậu quả đặc biệt nghiêm trọng.
+Khoan hồng đối với người tự thú, đầu thú, thành khẩn khai báo, tố giác đồng phạm, lập công chuộc tội, tích cực hợp tác với cơ quan có trách nhiệm trong việc phát hiện tội phạm hoặc trong quá trình giải quyết vụ án, ăn năn hối cải, tự nguyện sửa chữa hoặc bồi thường thiệt hại gây ra;
+------------------------------------------------------------------------------------------------------------------------
+case=d_vs_dd_distinct_dd
+query='3-1-đ'
+found=True level=diem reason=None normalized=3-1-đ
+text_full:
+[dieu 3] Nguyên tắc xử lý
+[khoan 1] Đối với người phạm tội:
+[diem đ] Đối với người lần đầu phạm tội ít nghiêm trọng, thì có thể áp dụng hình phạt nhẹ hơn hình phạt tù, giao họ cho cơ quan, tổ chức hoặc gia đình giám sát, giáo dục;
+------------------------------------------------------------------------------------------------------------------------
+case=existing_dieu_without_khoan
+query='89'
+found=True level=dieu reason=None normalized=89
+text_full:
+[dieu 89] Xóa án tích
+Pháp nhân thương mại bị kết án đương nhiên được xóa án tích nếu trong thời hạn 02 năm kể từ khi chấp hành xong hình phạt chính, hình phạt bổ sung, các quyết định khác của bản án hoặc từ khi hết thời hiệu thi hành bản án mà pháp nhân thương mại không thực hiện hành vi phạm tội mới.
+------------------------------------------------------------------------------------------------------------------------
+case=missing_khoan_for_dieu_without_khoan
+query='89-1'
+found=False level=None reason=khoan_not_found normalized=89-1
+text_full:
+
+------------------------------------------------------------------------------------------------------------------------

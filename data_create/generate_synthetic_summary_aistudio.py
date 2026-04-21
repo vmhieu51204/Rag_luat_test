@@ -10,8 +10,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import google.generativeai as genai
-from google.generativeai.types import GenerationConfig
+import google.genai as genai
+from google.genai import types
 
 
 DEFAULT_MODEL_NAME = "gemma-4-31b-it"
@@ -21,7 +21,7 @@ DEFAULT_OUTPUT_FIELD = "Synthetic_summary"
 DEFAULT_SLEEP_SECONDS = 20
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 90
 
-_model = None
+_client = None
 
 NOISY_MARKERS = [
     "role:",
@@ -40,18 +40,17 @@ NOISY_MARKERS = [
 
 
 def get_model(model_name: str):
-    """Lazily initialize a Google AI Studio model client."""
-    global _model
-    if _model is None:
+    """Lazily initialize a Google GenAI client."""
+    global _client
+    if _client is None:
         api_key = os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             raise EnvironmentError(
                 "GOOGLE_API_KEY environment variable is not set. "
                 "Get one at https://aistudio.google.com/app/apikey"
             )
-        genai.configure(api_key=api_key)
-        _model = genai.GenerativeModel(model_name=model_name)
-    return _model
+        _client = genai.Client(api_key=api_key)
+    return _client
 
 
 def get_nested_value(data: dict[str, Any], field_path: str) -> Any:
@@ -93,11 +92,12 @@ def build_prompt(input_text: str) -> str:
     )
 
 
-def generate_summary(model, prompt: str, request_timeout_seconds: float) -> str:
+def generate_summary(client, model_name: str, prompt: str, request_timeout_seconds: float) -> str:
     print(f"Calling generate_content (timeout={request_timeout_seconds}s)...")
-    response = model.generate_content(
-        prompt,
-        generation_config=GenerationConfig(
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
             temperature=0.3,
             response_mime_type="application/json",
             response_schema={
@@ -259,7 +259,7 @@ def process_file(
 
     prompt = build_prompt(input_text)
     synthetic_summary = cleanup_synthetic_summary(
-        generate_summary(model_holder["model"], prompt, request_timeout_seconds)
+        generate_summary(model_holder["model"], model_name, prompt, request_timeout_seconds)
     )
     if not is_valid_synthetic_summary(synthetic_summary):
         return False, f"Skipped (generated empty after cleanup): {file_name}"
