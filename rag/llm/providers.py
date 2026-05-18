@@ -42,6 +42,11 @@ def _extract_json_text(raw_text: str) -> str:
 def _parse_structured(raw_text: str, output_model: type[TModel]) -> TModel:
     cleaned = _extract_json_text(raw_text)
     data = json.loads(cleaned)
+    # Some models return JSON `null` when there is no result. Treat that as
+    # an empty object so Pydantic can validate into a model with all-None
+    # optional fields (which indicates absence rather than a parse error).
+    if data is None:
+        data = {}
     return output_model.model_validate(data)
 
 
@@ -61,24 +66,56 @@ def _generate_with_aistudio(
     user_prompt: str,
     output_model: type[TModel],
 ) -> tuple[TModel, dict[str, Any]]:
-    import google.genai as genai
-    from google.genai import types
+    # Mirror the pattern used in data_create/generate_synthetic_summary_aistudio.py
+    try:
+        import google.genai as genai
+        from google.genai import types
+    except Exception as exc:  # pragma: no cover - import/runtime guard
+        raise EnvironmentError(f"google.genai library unavailable: {exc.__class__.__name__}")
 
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         raise EnvironmentError("GOOGLE_API_KEY environment variable is not set")
 
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model_name,
-        contents=f"{system_prompt.strip()}\n\n{user_prompt.strip()}",
-        config=types.GenerateContentConfig(
-            temperature=0.0,
-            response_mime_type="application/json",
-        ),
-    )
+    # Lazily create a client instance on module level to reuse connections
+    global _aistudio_client
+    try:
+        _aistudio_client
+    except NameError:
+        _aistudio_client = None
+    if _aistudio_client is None:
+        _aistudio_client = genai.Client(api_key=api_key)
 
-    raw_text = response.text or ""
+    # Default request timeout can be configured via env var
+    request_timeout = float(os.environ.get("LLM_REQUEST_TIMEOUT", "90"))
+
+    # Some google.genai client versions accept `request_options` while others do not.
+    # Try calling with `request_options` first and fall back if the client raises
+    # a TypeError for unexpected kwargs (mirrors data_create/generate_synthetic_summary_aistudio.py).
+    try:
+        response = _aistudio_client.models.generate_content(
+            model=model_name,
+            contents=f"{system_prompt.strip()}\n\n{user_prompt.strip()}",
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+            ),
+            request_options={"timeout": request_timeout},
+        )
+    except TypeError:
+        response = _aistudio_client.models.generate_content(
+            model=model_name,
+            contents=f"{system_prompt.strip()}\n\n{user_prompt.strip()}",
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+            ),
+        )
+
+    raw_text = getattr(response, "text", "") or ""
+
+    # Try to parse structured JSON, but if parsing fails raise a JSON error to be
+    # handled by the caller (so fallback attempts can occur).
     parsed = _parse_structured(raw_text, output_model)
 
     usage_meta = getattr(response, "usage_metadata", None)
@@ -88,6 +125,7 @@ def _generate_with_aistudio(
         total_tokens=getattr(usage_meta, "total_token_count", 0) or 0,
         raw_text=raw_text,
     )
+    usage["response_repr"] = repr(response)
     return parsed, usage
 
 
@@ -124,6 +162,7 @@ def _generate_with_openrouter(
         total_tokens=getattr(usage_obj, "total_tokens", 0) or 0,
         raw_text=raw_text,
     )
+    usage["response_repr"] = repr(response)
     return parsed, usage
 
 
@@ -160,6 +199,7 @@ def _generate_with_openai(
         total_tokens=getattr(usage_obj, "total_tokens", 0) or 0,
         raw_text=raw_text,
     )
+    usage["response_repr"] = repr(response)
     return parsed, usage
 
 
@@ -209,7 +249,7 @@ def generate_structured_output_with_fallback(
     Fallback order:
     1) OpenRouter free tier model
     2) AI Studio default model
-    3) OpenRouter standard tier (same model without ':free')
+    3) OpenRouter paid tier model (used only if free and AI Studio fail)
     """
 
     if preferred_provider is None:
@@ -218,7 +258,7 @@ def generate_structured_output_with_fallback(
         preferred = LLMProvider(preferred_provider)
 
     openrouter_free_model = model_name or default_model_for_provider(LLMProvider.OPENROUTER)
-    openrouter_paid_model = openrouter_free_model[:-5] if openrouter_free_model.endswith(":free") else openrouter_free_model
+    openrouter_paid_model = openrouter_free_model[:-5] + ":paid"
 
     ordered_attempts: list[tuple[LLMProvider, str]] = [
         (LLMProvider.OPENROUTER, openrouter_free_model),

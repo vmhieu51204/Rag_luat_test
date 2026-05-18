@@ -140,7 +140,7 @@ def main():
     parser.add_argument("--input_dir", required=True, help="Folder with raw JSON files")
     parser.add_argument("--train_dir", required=True, help="Folder to output train JSON files")
     parser.add_argument("--test_dir", required=True, help="Folder to output test JSON files")
-    parser.add_argument("--test_ratio", type=float, default=0.1, help="Fraction of documents held out as test set")
+    parser.add_argument("--test_ratio", type=float, default=0.08, help="Fraction of documents held out as test set")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for splitting")
     parser.add_argument(
         "--list_base_name",

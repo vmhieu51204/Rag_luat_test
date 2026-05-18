@@ -51,6 +51,9 @@ from rag.runtime.retrieval import RetrievalRuntime, RetrievalRuntimeConfig
 
 load_dotenv()
 
+# Always treat these core BLHS Dieu as present in retrieved law-clause candidates.
+ALWAYS_INCLUDE_DIEU = ("51", "52", "47", "38", "55", "56")
+
 
 def _normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
@@ -399,7 +402,7 @@ def _build_prompts(
 ) -> tuple[str, str]:
     system_prompt = (
         "You are an expert Vietnamese criminal judgment assistant. "
-        "Return only valid JSON. Predict legal outcomes strictly from provided facts and law clauses."
+        "Return only valid JSON. Predict legal outcomes strictly from provided facts and law clauses. "
     )
 
     requirements = [
@@ -411,6 +414,8 @@ def _build_prompts(
         "Predict Trach_Nhiem_Dan_Su when applicable.",
         "Use explicit_law_clauses (retrieved at Dieu level from similar past cases) as legal references and select only applicable clauses.",
         "Before producing output, reason from the provided case_fields, Defendant_info, and explicit_law_clauses.",
+        # NEW: Explicit requirement to include the 50s clauses
+        "MANDATORY: You must evaluate and include applicable general sentencing provisions from the 50s articles (e.g., Article 51 for mitigating factors, Article 52 for aggravating factors, Articles 55/56 for sentence synthesis) in Applied_Law_Clauses."
     ]
     constraints = [
         "No markdown, no extra explanation.",
@@ -431,30 +436,10 @@ def _build_prompts(
                 "Use the factual timeline in case_fields to identify offense behavior.",
                 "Use Defendant_info for circumstances that affect sentencing and mitigating/aggravating factors.",
                 "Select applicable clauses from explicit_law_clauses before deciding Toi_Danh and Phat_Tu.",
+                # NEW: Explicit reasoning instruction for Phat_Tu adjustments
+                "When calculating the final Phat_Tu, you must explicitly adjust the sentence length based on the presence of mitigating factors (Article 51), aggravating factors (Article 52), or previous convictions/synthesis (Articles 55/56) found in Defendant_info."
             ],
             "output_schema": build_output_schema_instruction(GenerationOutput),
-            "output_schema_example": {
-                "defendants": [
-                    {
-                        "Bi_Cao": "Nguyen Van A",
-                        "Phan_Tich_Phap_Ly": "Tóm tắt phân tích pháp lý ngắn gọn dựa trên sự kiện được cung cấp.",
-                        "Toi_Danh": "Trộm cắp tài sản",
-                        "Applied_Law_Clauses": [
-                            {
-                                "Dieu": "173",
-                                "Khoan": "1",
-                                "Diem": "a",
-                                "Tinh_tiet_ap_dung": "Lấy trộm điện thoại từ túi nạn nhân",
-                                "Bo_Luat_Va_Van_Ban_Khac": "BLHS"
-                            }
-                        ],
-                        "Phat_Tu": "6 tháng tù",
-                        "Phat_Tien": None,
-                        "Trach_Nhiem_Dan_Su": None,
-                        "Xu_Ly_Vat_Chung": None,
-                    }
-                ]
-            },
             "constraints": constraints,
         },
     }
@@ -506,8 +491,12 @@ def _evaluate_single_doc(
         train_articles_index=train_articles_index,
     )
 
+    forced_clause_set = set(similar_case_context.get("similar_case_law_clause_set", []))
+    forced_clause_set |= set(ALWAYS_INCLUDE_DIEU)
+    similar_case_context["similar_case_law_clause_set"] = sorted(forced_clause_set)
+
     explicit_law_clauses = _retrieve_explicit_law_by_dieu(
-        law_signatures=set(similar_case_context.get("similar_case_law_clause_set", [])),
+        law_signatures=forced_clause_set,
         law_retriever=law_retriever,
     )
 
@@ -713,7 +702,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate verdict generation and law-clause filtering using test cases, "
-            "law embedding retrieval, and LLM generation."
+            "law embedding retrieval, fixed system-law priors, and LLM generation."
         )
     )
     parser.add_argument("--test-dir", default="chunk/test", help="Directory with test JSON files")
@@ -721,7 +710,7 @@ def main() -> None:
     parser.add_argument("--law-json", default="raw_law.json", help="Path to raw law JSON used for embedding")
     parser.add_argument("--case-db-dir", default="output/generation_eval/case_db", help="Case Chroma DB directory")
     parser.add_argument("--law-db-dir", default="output/generation_eval/law_db", help="Law Chroma DB directory")
-    parser.add_argument("--results-out", default="output/generation_eval/verdict_generation_eval.json")
+    parser.add_argument("--results-out", default="output/generation_eval/verdict_generation_system_eval.json")
     parser.add_argument("--provider", choices=[p.value for p in LLMProvider], default="openrouter")
     parser.add_argument("--model", default=None, help="Provider model override")
     parser.add_argument("--embed-model", default=DEFAULT_MODEL_NAME, help="Embedding model for law retrieval")
@@ -845,12 +834,55 @@ def main() -> None:
     print(f"Input fields={input_fields}")
     print(f"Query fields={query_fields}")
     print(f"Train embedding fields={train_embedding_fields}")
+    print(f"Always-included Dieu={list(ALWAYS_INCLUDE_DIEU)}")
     print("Past-case retrieval enabled for law candidate mining (not passed as narrative context to LLM)")
     print(f"Law retriever dieu index size={len(getattr(law_retriever, '_dieu_index', {}))}")
     print(f"Train label index size={len(train_articles_index)} (skipped={len(train_skipped)})")
 
     per_doc: list[dict[str, Any]] = []
+    completed_files: set[str] = set()
+
+    if results_out.exists():
+        try:
+            with open(results_out, "r", encoding="utf-8") as fh:
+                existing_data = json.load(fh)
+                per_doc = existing_data.get("per_doc", [])
+                completed_files = {doc.get("source_file") for doc in per_doc if doc.get("source_file")}
+            print(f"Resuming from {results_out}: {len(completed_files)} files already processed.")
+        except Exception as e:
+            print(f"Could not load existing results from {results_out}: {e}")
+            per_doc = []
+
+    config_dict = {
+        "train_dir": str(train_dir),
+        "test_dir": str(test_dir),
+        "law_json": str(law_json),
+        "case_db_dir": str(case_db_dir),
+        "law_db_dir": str(law_db_dir),
+        "provider": provider.value,
+        "model": model_name,
+        "provider_fallback": use_provider_fallback,
+        "embedding_model": args.embed_model,
+        "device": args.device,
+        "collection_name": args.collection_name,
+        "top_k_law": args.top_k_law,
+        "top_k_case": args.top_k_case,
+        "input_fields": input_fields,
+        "query_fields": query_fields,
+        "train_embedding_fields": train_embedding_fields,
+        "always_include_dieu": list(ALWAYS_INCLUDE_DIEU),
+        "only_blhs": args.only_blhs,
+        "n_train_label_index": len(train_articles_index),
+        "n_train_label_skipped": len(train_skipped),
+    }
+
+    results_out.parent.mkdir(parents=True, exist_ok=True)
+
     for path in files:
+        if path.name in completed_files:
+            print(f"Already processed, skipping: {path.name}")
+            continue
+
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         result = _evaluate_single_doc(
@@ -868,36 +900,27 @@ def main() -> None:
             use_provider_fallback=use_provider_fallback,
         )
         per_doc.append(result)
-        print(f"{result['status']}: {path.name} ({result.get('reason', '')})")
+        llm_info = result.get("llm", {})
+        used_provider = llm_info.get("used_provider", "unknown")
+        used_model = llm_info.get("used_model", "unknown")
+        print(f"{result['status']}: {path.name} ({result.get('reason', '')}) [Provider: {used_provider}, Tier: {used_model}]")
 
+        intermediate_output = {
+            "config": config_dict,
+            "summary": None,
+            "per_doc": per_doc,
+        }
+        with open(results_out, "w", encoding="utf-8") as fh:
+            json.dump(intermediate_output, fh, ensure_ascii=False, indent=2)
+
+    print("Calculating final metrics...")
     summary = _aggregate(per_doc)
     output = {
-        "config": {
-            "train_dir": str(train_dir),
-            "test_dir": str(test_dir),
-            "law_json": str(law_json),
-            "case_db_dir": str(case_db_dir),
-            "law_db_dir": str(law_db_dir),
-            "provider": provider.value,
-            "model": model_name,
-            "provider_fallback": use_provider_fallback,
-            "embedding_model": args.embed_model,
-            "device": args.device,
-            "collection_name": args.collection_name,
-            "top_k_law": args.top_k_law,
-            "top_k_case": args.top_k_case,
-            "input_fields": input_fields,
-            "query_fields": query_fields,
-            "train_embedding_fields": train_embedding_fields,
-            "only_blhs": args.only_blhs,
-            "n_train_label_index": len(train_articles_index),
-            "n_train_label_skipped": len(train_skipped),
-        },
+        "config": config_dict,
         "summary": summary,
         "per_doc": per_doc,
     }
 
-    results_out.parent.mkdir(parents=True, exist_ok=True)
     with open(results_out, "w", encoding="utf-8") as fh:
         json.dump(output, fh, ensure_ascii=False, indent=2)
 
@@ -909,5 +932,5 @@ if __name__ == "__main__":
     main()
 
 """
-/home/hieujayce/Downloads/complete_repo/.venv/bin/python -m rag.evaluation.generation_eval --test-dir chunk/test --train-dir chunk/train --law-json raw_law.json --first-n 5 --results-out output/generation_eval/verdict_generation_eval_first5.json
+/home/hieujayce/Downloads/complete_repo/.venv/bin/python -m rag.evaluation.generation_system_eval --test-dir chunk/test --train-dir chunk/train --law-json raw_law.json --first-n 50 --results-out output/generation_eval/system_afterfix_first50.json
 """

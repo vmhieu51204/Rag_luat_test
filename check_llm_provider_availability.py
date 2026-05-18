@@ -31,6 +31,7 @@ class ProviderSpec:
 class CheckResult:
     provider: str
     key_name: str
+    tier: str
     key_configured: bool
     api_reachable: str
     generation_test: str
@@ -139,12 +140,28 @@ def _interpret_http_result(status_code: int, response_text: str) -> tuple[str, s
     return "no", detail
 
 
+def _model_tier(model_name: str, provider: LLMProvider) -> str:
+    if provider == LLMProvider.AISTUDIO:
+        return "free"
+    if provider == LLMProvider.OPENAI:
+        return "paid"
+    if model_name.endswith(":free"):
+        return "free"
+    if model_name.endswith(":paid"):
+        return "paid"
+    return "paid"
+
+
 def _check_provider(spec: ProviderSpec, env_values: dict[str, str], skip_network: bool, timeout: float) -> CheckResult:
     api_key = _clean_env_value(env_values.get(spec.key_name, ""))
+    provider_enum = LLMProvider(spec.name)
+    model_name = default_model_for_provider(provider_enum)
+    tier = _model_tier(model_name, provider_enum)
     if not api_key:
         return CheckResult(
             provider=spec.name,
             key_name=spec.key_name,
+            tier=tier,
             key_configured=False,
             api_reachable="n/a",
             generation_test="n/a",
@@ -155,6 +172,7 @@ def _check_provider(spec: ProviderSpec, env_values: dict[str, str], skip_network
         return CheckResult(
             provider=spec.name,
             key_name=spec.key_name,
+            tier=tier,
             key_configured=True,
             api_reachable="skipped",
             generation_test="pending",
@@ -172,6 +190,7 @@ def _check_provider(spec: ProviderSpec, env_values: dict[str, str], skip_network
         return CheckResult(
             provider=spec.name,
             key_name=spec.key_name,
+            tier=tier,
             key_configured=True,
             api_reachable=reachable,
             generation_test="pending",
@@ -181,6 +200,7 @@ def _check_provider(spec: ProviderSpec, env_values: dict[str, str], skip_network
         return CheckResult(
             provider=spec.name,
             key_name=spec.key_name,
+            tier=tier,
             key_configured=True,
             api_reachable="no",
             generation_test="pending",
@@ -304,12 +324,13 @@ def _run_generation_test(spec: ProviderSpec, *, debug_raw_response: bool) -> tup
                 total_tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
                 if total_tokens is not None:
                     usage_summary = f"; total_tokens={total_tokens}"
+                tier = _model_tier(model_name, provider_enum)
                 raw_preview = ""
                 if debug_raw_response and isinstance(usage, dict):
                     preview = (usage.get("raw_response_preview") or "").strip()
                     if preview:
                         raw_preview = f"; raw_preview={_truncate_preview(preview)}"
-                return "yes", f"generation ok via {model_name}{usage_summary}{raw_preview}"
+                return "yes", f"generation ok via {spec.name} ({tier}) model={model_name}{usage_summary}{raw_preview}"
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{model_name}: {exc.__class__.__name__}")
 
@@ -318,7 +339,8 @@ def _run_generation_test(spec: ProviderSpec, *, debug_raw_response: bool) -> tup
             for user_prompt in user_prompt_options:
                 ok, raw_text, message = _aistudio_genai_fallback(model_name, system_prompt, user_prompt)
                 if ok:
-                    detail = f"generation ok via google.genai fallback ({model_name})"
+                    tier = _model_tier(model_name, provider_enum)
+                    detail = f"generation ok via google.genai fallback {spec.name} ({tier}) model={model_name}"
                     if debug_raw_response:
                         detail = f"{detail}; raw_preview={_truncate_preview(raw_text)}"
                     return "yes", detail
@@ -356,6 +378,7 @@ def _apply_generation_tests(
                 CheckResult(
                     provider=result.provider,
                     key_name=result.key_name,
+                    tier=result.tier,
                     key_configured=result.key_configured,
                     api_reachable=result.api_reachable,
                     generation_test="skipped",
@@ -374,6 +397,7 @@ def _apply_generation_tests(
                 CheckResult(
                     provider=result.provider,
                     key_name=result.key_name,
+                    tier=result.tier,
                     key_configured=result.key_configured,
                     api_reachable=result.api_reachable,
                     generation_test=generation_status,
@@ -386,6 +410,7 @@ def _apply_generation_tests(
                 CheckResult(
                     provider=result.provider,
                     key_name=result.key_name,
+                    tier=result.tier,
                     key_configured=result.key_configured,
                     api_reachable=result.api_reachable,
                     generation_test="no",
@@ -397,10 +422,11 @@ def _apply_generation_tests(
 
 
 def _print_results(results: list[CheckResult]) -> None:
-    headers = ["provider", "key", "configured", "api_reachable", "generation_test", "detail"]
+    headers = ["provider", "tier", "key", "configured", "api_reachable", "generation_test", "detail"]
     rows = [
         [
             r.provider,
+            r.tier,
             r.key_name,
             "yes" if r.key_configured else "no",
             r.api_reachable,

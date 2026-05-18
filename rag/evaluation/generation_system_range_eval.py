@@ -36,7 +36,7 @@ from rag.config import (
     VERDICT_FIELD,
 )
 from rag.core.law_retriever import LawClauseRetriever
-from rag.core.sentencing import extract_imprisonment_months
+from rag.parse_penalty import parse_penalty_to_months, compute_range_overlap
 from rag.core.verdict_labels import is_blhs_legal_source, split_multi_value
 from rag.evaluation.retrieval_eval import load_articles_index
 from rag.llm.providers import (
@@ -46,10 +46,13 @@ from rag.llm.providers import (
     generate_structured_output_with_fallback,
 )
 from rag.core.embeddings import run_pipeline
-from rag.generation.schemas import GenerationOutput, build_output_schema_instruction
+from rag.generation.schemas import GenerationRangeOutput, build_output_schema_instruction
 from rag.runtime.retrieval import RetrievalRuntime, RetrievalRuntimeConfig
 
 load_dotenv()
+
+# Always treat these core BLHS Dieu as present in retrieved law-clause candidates.
+ALWAYS_INCLUDE_DIEU = ("51", "52", "47", "38", "55", "56")
 
 
 def _normalize_space(text: str) -> str:
@@ -192,13 +195,23 @@ def _extract_gt_defendants(data: dict[str, Any], *, only_blhs: bool) -> list[dic
     if not isinstance(verdict_items, list):
         return []
 
+    vks_items = data.get("De_Nghi_Cua_Vien_Kiem_Sat")
+    vks_by_name = {}
+    if isinstance(vks_items, list):
+        for item in vks_items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("Bi_Cao") or "").strip()
+            if name:
+                vks_by_name[_name_key(name)] = str(item.get("Phat_Tu") or "").strip()
+
     out: list[dict[str, Any]] = []
     for item in verdict_items:
         if not isinstance(item, dict):
             continue
         name = str(item.get("Bi_Cao") or "").strip()
         toi_danh = str(item.get("Pham_Toi") or "").strip()
-        phat_tu = str(item.get("Phat_Tu") or "").strip()
+        phat_tu = vks_by_name.get(_name_key(name), "")
         phat_tien = str(item.get("Phat_Tien") or "").strip()
         trach_nhiem = str(item.get("Trach_Nhiem_Dan_Su") or "").strip()
         xu_ly_vat_chung = str(data.get("Xu_Ly_Vat_Chung") or "").strip()
@@ -229,7 +242,7 @@ def _extract_gt_defendants(data: dict[str, Any], *, only_blhs: bool) -> list[dic
     return out
 
 
-def _extract_pred_defendants(pred: GenerationOutput, *, only_blhs: bool) -> list[dict[str, Any]]:
+def _extract_pred_defendants(pred: GenerationRangeOutput, *, only_blhs: bool) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for defendant in pred.defendants:
         signatures: set[str] = set()
@@ -259,7 +272,7 @@ def _extract_pred_defendants(pred: GenerationOutput, *, only_blhs: bool) -> list
                 "Bi_Cao": _normalize_space(defendant.Bi_Cao),
                 "Phan_Tich_Phap_Ly": _normalize_space(defendant.Phan_Tich_Phap_Ly or ""),
                 "Toi_Danh": _normalize_space(defendant.Toi_Danh or ""),
-                "Phat_Tu": _normalize_space(defendant.Phat_Tu or ""),
+                "Phat_Tu": _normalize_space(defendant.Phat_Tu_Range or ""),
                 "Phat_Tien": _normalize_space(defendant.Phat_Tien or ""),
                 "Trach_Nhiem_Dan_Su": _normalize_space(defendant.Trach_Nhiem_Dan_Su or ""),
                 "Xu_Ly_Vat_Chung": _normalize_space(pred.Xu_Ly_Vat_Chung or ""),
@@ -293,7 +306,7 @@ def _macro_mean(values: list[float]) -> float:
 
 
 def _extract_phat_tu_months(text: str | None) -> int:
-    return extract_imprisonment_months(text)
+    return 0
 
 
 def _retrieve_similar_case_doc_ids(
@@ -399,7 +412,7 @@ def _build_prompts(
 ) -> tuple[str, str]:
     system_prompt = (
         "You are an expert Vietnamese criminal judgment assistant. "
-        "Return only valid JSON. Predict legal outcomes strictly from provided facts and law clauses."
+        "Return only valid JSON. Predict legal outcomes strictly from provided facts and law clauses. "
     )
 
     requirements = [
@@ -407,17 +420,19 @@ def _build_prompts(
         "For each defendant, list applied law clauses in Applied_Law_Clauses.",
         "For each Applied_Law_Clauses item, fill Tinh_tiet_ap_dung with concise case facts that justify applying that clause.",
         "State Toi_Danh.",
-        "Predict a concrete final Phat_Tu verdict for each defendant.",
+        "Predict an imprisonment range (Phat_Tu_Range) for each defendant based on the law article.",
         "Predict Trach_Nhiem_Dan_Su when applicable.",
         "Use explicit_law_clauses (retrieved at Dieu level from similar past cases) as legal references and select only applicable clauses.",
         "Before producing output, reason from the provided case_fields, Defendant_info, and explicit_law_clauses.",
+        # NEW: Explicit requirement to include the 50s clauses
+        "MANDATORY: You must evaluate and include applicable general sentencing provisions from the 50s articles (e.g., Article 51 for mitigating factors, Article 52 for aggravating factors, Articles 55/56 for sentence synthesis) in Applied_Law_Clauses."
     ]
     constraints = [
         "No markdown, no extra explanation.",
         "Do not invent defendant names not supported by case fields.",
         "Applied_Law_Clauses should prioritize selected clauses from explicit_law_clauses.",
         "Tinh_tiet_ap_dung must cite only facts present in case_fields or Defendant_info; do not invent facts.",
-        "Phat_Tu must be a single concrete verdict statement; do not output a range like 'từ X đến Y năm tù'.",
+        "Phat_Tu_Range must be a predicted imprisonment range (e.g. 'từ 02 năm đến 03 năm tù').",
     ]
 
     input_payload = {
@@ -430,31 +445,11 @@ def _build_prompts(
             "reasoning_instruction": [
                 "Use the factual timeline in case_fields to identify offense behavior.",
                 "Use Defendant_info for circumstances that affect sentencing and mitigating/aggravating factors.",
-                "Select applicable clauses from explicit_law_clauses before deciding Toi_Danh and Phat_Tu.",
+                "Select applicable clauses from explicit_law_clauses before deciding Toi_Danh and Phat_Tu_Range.",
+                # NEW: Explicit reasoning instruction for Phat_Tu adjustments
+                "When calculating the final Phat_Tu_Range, you must explicitly adjust the sentence length based on the presence of mitigating factors (Article 51), aggravating factors (Article 52), or previous convictions/synthesis (Articles 55/56) found in Defendant_info."
             ],
-            "output_schema": build_output_schema_instruction(GenerationOutput),
-            "output_schema_example": {
-                "defendants": [
-                    {
-                        "Bi_Cao": "Nguyen Van A",
-                        "Phan_Tich_Phap_Ly": "Tóm tắt phân tích pháp lý ngắn gọn dựa trên sự kiện được cung cấp.",
-                        "Toi_Danh": "Trộm cắp tài sản",
-                        "Applied_Law_Clauses": [
-                            {
-                                "Dieu": "173",
-                                "Khoan": "1",
-                                "Diem": "a",
-                                "Tinh_tiet_ap_dung": "Lấy trộm điện thoại từ túi nạn nhân",
-                                "Bo_Luat_Va_Van_Ban_Khac": "BLHS"
-                            }
-                        ],
-                        "Phat_Tu": "6 tháng tù",
-                        "Phat_Tien": None,
-                        "Trach_Nhiem_Dan_Su": None,
-                        "Xu_Ly_Vat_Chung": None,
-                    }
-                ]
-            },
+            "output_schema": build_output_schema_instruction(GenerationRangeOutput),
             "constraints": constraints,
         },
     }
@@ -506,8 +501,12 @@ def _evaluate_single_doc(
         train_articles_index=train_articles_index,
     )
 
+    forced_clause_set = set(similar_case_context.get("similar_case_law_clause_set", []))
+    forced_clause_set |= set(ALWAYS_INCLUDE_DIEU)
+    similar_case_context["similar_case_law_clause_set"] = sorted(forced_clause_set)
+
     explicit_law_clauses = _retrieve_explicit_law_by_dieu(
-        law_signatures=set(similar_case_context.get("similar_case_law_clause_set", [])),
+        law_signatures=forced_clause_set,
         law_retriever=law_retriever,
     )
 
@@ -526,7 +525,7 @@ def _evaluate_single_doc(
     usage: dict[str, Any] = {}
     parse_error = None
     generation_error = None
-    pred_output: GenerationOutput | None = None
+    pred_output: GenerationRangeOutput | None = None
     llm_used_provider = provider.value
     llm_used_model = model_name
 
@@ -537,7 +536,7 @@ def _evaluate_single_doc(
                 model_name=model_name,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                output_model=GenerationOutput,
+                output_model=GenerationRangeOutput,
             )
         else:
             pred_output, usage = generate_structured_output(
@@ -545,7 +544,7 @@ def _evaluate_single_doc(
                 model_name=model_name,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                output_model=GenerationOutput,
+                output_model=GenerationRangeOutput,
             )
     except (ValidationError, json.JSONDecodeError) as exc:
         parse_error = str(exc)
@@ -600,7 +599,7 @@ def _evaluate_single_doc(
     clause_precision_values: list[float] = []
     clause_recall_values: list[float] = []
     clause_f1_values: list[float] = []
-    phat_tu_sq_err_values: list[float] = []
+    phat_tu_iou_values: list[float] = []
 
     defendants: list[dict[str, Any]] = []
 
@@ -614,10 +613,10 @@ def _evaluate_single_doc(
         clause_recall_values.append(float(prf["recall"]))
         clause_f1_values.append(float(prf["f1"]))
 
-        gt_months = _extract_phat_tu_months((gt_item or {}).get("Phat_Tu"))
-        pred_months = _extract_phat_tu_months((pred_item or {}).get("Phat_Tu"))
-        sq_err = float((pred_months - gt_months) ** 2)
-        phat_tu_sq_err_values.append(sq_err)
+        gt_range = parse_penalty_to_months((gt_item or {}).get("Phat_Tu") or "")
+        pred_range = parse_penalty_to_months((pred_item or {}).get("Phat_Tu") or "")
+        iou = compute_range_overlap(gt_range, pred_range)
+        phat_tu_iou_values.append(iou)
 
         defendants.append(
             {
@@ -626,18 +625,18 @@ def _evaluate_single_doc(
                 "prediction": _compact_defendant_item(pred_item),
                 "metrics": {
                     "law_clause_prf": prf,
-                    "phat_tu_months": {
-                        "ground_truth": gt_months,
-                        "prediction": pred_months,
-                        "squared_error": _safe_float(sq_err),
+                    "phat_tu_range": {
+                        "ground_truth": gt_range,
+                        "prediction": pred_range,
+                        "iou": _safe_float(iou),
                     },
                 },
             }
         )
 
-    phat_tu_rmse_months = (
-        _safe_float((sum(phat_tu_sq_err_values) / len(phat_tu_sq_err_values)) ** 0.5)
-        if phat_tu_sq_err_values
+    phat_tu_mean_iou = (
+        _safe_float(sum(phat_tu_iou_values) / len(phat_tu_iou_values))
+        if phat_tu_iou_values
         else 0.0
     )
 
@@ -671,7 +670,7 @@ def _evaluate_single_doc(
             "law_clause_precision_macro": _macro_mean(clause_precision_values),
             "law_clause_recall_macro": _macro_mean(clause_recall_values),
             "law_clause_f1_macro": _macro_mean(clause_f1_values),
-            "phat_tu_rmse_months": phat_tu_rmse_months,
+            "phat_tu_mean_iou": phat_tu_mean_iou,
             "n_defendants_scored": len(all_keys),
         },
         "_usage": usage,
@@ -693,7 +692,7 @@ def _aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
     clause_p = [float(item["doc_metrics"]["law_clause_precision_macro"]) for item in processed]
     clause_r = [float(item["doc_metrics"]["law_clause_recall_macro"]) for item in processed]
     clause_f1 = [float(item["doc_metrics"]["law_clause_f1_macro"]) for item in processed]
-    rmse_months = [float(item["doc_metrics"]["phat_tu_rmse_months"]) for item in processed]
+    mean_iou = [float(item["doc_metrics"]["phat_tu_mean_iou"]) for item in processed]
 
     return {
         "n_total": len(results),
@@ -704,7 +703,7 @@ def _aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
             "law_clause_set_precision_macro": _macro_mean(clause_p),
             "law_clause_set_recall_macro": _macro_mean(clause_r),
             "law_clause_set_f1_macro": _macro_mean(clause_f1),
-            "phat_tu_rmse_months_macro": _macro_mean(rmse_months),
+            "phat_tu_mean_iou_macro": _macro_mean(mean_iou),
         },
     }
 
@@ -713,7 +712,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate verdict generation and law-clause filtering using test cases, "
-            "law embedding retrieval, and LLM generation."
+            "law embedding retrieval, fixed system-law priors, and LLM generation."
         )
     )
     parser.add_argument("--test-dir", default="chunk/test", help="Directory with test JSON files")
@@ -721,7 +720,7 @@ def main() -> None:
     parser.add_argument("--law-json", default="raw_law.json", help="Path to raw law JSON used for embedding")
     parser.add_argument("--case-db-dir", default="output/generation_eval/case_db", help="Case Chroma DB directory")
     parser.add_argument("--law-db-dir", default="output/generation_eval/law_db", help="Law Chroma DB directory")
-    parser.add_argument("--results-out", default="output/generation_eval/verdict_generation_eval.json")
+    parser.add_argument("--results-out", default="output/generation_eval/verdict_generation_system_range_eval.json")
     parser.add_argument("--provider", choices=[p.value for p in LLMProvider], default="openrouter")
     parser.add_argument("--model", default=None, help="Provider model override")
     parser.add_argument("--embed-model", default=DEFAULT_MODEL_NAME, help="Embedding model for law retrieval")
@@ -845,6 +844,7 @@ def main() -> None:
     print(f"Input fields={input_fields}")
     print(f"Query fields={query_fields}")
     print(f"Train embedding fields={train_embedding_fields}")
+    print(f"Always-included Dieu={list(ALWAYS_INCLUDE_DIEU)}")
     print("Past-case retrieval enabled for law candidate mining (not passed as narrative context to LLM)")
     print(f"Law retriever dieu index size={len(getattr(law_retriever, '_dieu_index', {}))}")
     print(f"Train label index size={len(train_articles_index)} (skipped={len(train_skipped)})")
@@ -889,6 +889,7 @@ def main() -> None:
             "input_fields": input_fields,
             "query_fields": query_fields,
             "train_embedding_fields": train_embedding_fields,
+            "always_include_dieu": list(ALWAYS_INCLUDE_DIEU),
             "only_blhs": args.only_blhs,
             "n_train_label_index": len(train_articles_index),
             "n_train_label_skipped": len(train_skipped),
@@ -909,5 +910,5 @@ if __name__ == "__main__":
     main()
 
 """
-/home/hieujayce/Downloads/complete_repo/.venv/bin/python -m rag.evaluation.generation_eval --test-dir chunk/test --train-dir chunk/train --law-json raw_law.json --first-n 5 --results-out output/generation_eval/verdict_generation_eval_first5.json
+/home/hieujayce/Downloads/complete_repo/.venv/bin/python -m rag.evaluation.generation_system_eval --test-dir chunk/test --train-dir chunk/train --law-json raw_law.json --first-n 50 --results-out output/generation_eval/system_afterfix_first50.json
 """

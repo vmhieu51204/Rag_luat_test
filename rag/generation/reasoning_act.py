@@ -1,0 +1,638 @@
+"""ReAct-style judgment prediction using exact law lookup plus past-case RAG."""
+
+from __future__ import annotations
+
+import json
+import re
+import unicodedata
+from pathlib import Path
+from typing import Any
+
+from pydantic import ValidationError
+
+from rag.config import LEGAL_SOURCE_FIELD, VERDICT_FIELD
+from rag.core.law_retriever import LawClauseRetriever
+from rag.core.verdict_labels import is_blhs_legal_source
+from rag.evaluation.retrieval_eval import load_articles_index
+from rag.generation.schemas import (
+    CandidateOffence,
+    GenerationOutput,
+    ReasonActAnalysisOutput,
+    ReasonActFinalOutput,
+    ReasonActLegalAnalysis,
+    ReasonActTrace,
+    RetrievedLawArticle,
+    SimilarCaseSummary,
+    SupportingArticleAssessment,
+    build_output_schema_instruction,
+)
+from rag.llm.providers import (
+    LLMProvider,
+    generate_structured_output,
+    generate_structured_output_with_fallback,
+)
+from rag.runtime.retrieval import RetrievalRuntime
+
+MANDATORY_SUPPORTING_DIEU = ("38", "50", "51", "52", "53", "54", "55", "56", "57", "58", "65", "47")
+DEFAULT_REASON_ACT_TRAIN_FIELDS = ["Summary", "NOI_DUNG_VU_AN", "NHAN_DINH_CUA_TOA_AN", "Tang_nang", "Giam_nhe"]
+
+
+def _normalize_space(text: Any) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip())
+
+
+def _strip_accents(text: str) -> str:
+    norm = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in norm if not unicodedata.combining(ch))
+
+
+def _tokenize(text: str) -> set[str]:
+    folded = _strip_accents(text).lower()
+    return {tok for tok in re.findall(r"[a-z0-9]+", folded) if len(tok) >= 3}
+
+
+def _resolve_field_value(data: dict[str, Any], field: str) -> Any:
+    if field in {"Defendant_info", "defendant_info", "Thong_Tin_Bi_Cao"}:
+        info = data.get("THONG_TIN_CHUNG")
+        return info.get("Thong_Tin_Bi_Cao") if isinstance(info, dict) else None
+    if "." not in field:
+        return data.get(field)
+    cur: Any = data
+    for part in field.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def extract_input_payload(data: dict[str, Any], fields: list[str]) -> dict[str, str]:
+    payload: dict[str, str] = {}
+    for field in fields:
+        value = _resolve_field_value(data, field)
+        if value is None:
+            continue
+        text = value.strip() if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        if text.strip():
+            payload[field] = text.strip()
+    return payload
+
+
+def build_query_text(data: dict[str, Any], fields: list[str]) -> str:
+    payload = extract_input_payload(data, fields)
+    return "\n\n".join(f"[{key}]\n{value}" for key, value in payload.items()).strip()
+
+
+def doc_id_from_case(data: dict[str, Any], fallback: str = "") -> str:
+    info = data.get("THONG_TIN_CHUNG")
+    if isinstance(info, dict):
+        doc_id = info.get("Ma_Ban_An")
+        if doc_id:
+            return str(doc_id).strip()
+    return str(data.get("Ma_Ban_An") or fallback).strip()
+
+
+def candidate_signature(candidate: CandidateOffence) -> str | None:
+    if not candidate.Dieu:
+        return None
+    signature = str(candidate.Dieu).strip()
+    if candidate.Khoan:
+        signature += f"-{str(candidate.Khoan).strip()}"
+    if candidate.Diem:
+        signature += f"-{str(candidate.Diem).strip().lower()}"
+    return signature
+
+
+def _retrieved_article_from_result(signature: str, result: dict[str, Any]) -> RetrievedLawArticle:
+    return RetrievedLawArticle(
+        signature=signature,
+        found=bool(result.get("found")),
+        level=result.get("level"),
+        text=result.get("text") if result.get("found") else None,
+        missing_reason=None if result.get("found") else str(result.get("reason") or "not_found"),
+    )
+
+
+def retrieve_law_articles(signatures: list[str], law_retriever: LawClauseRetriever) -> list[RetrievedLawArticle]:
+    articles: list[RetrievedLawArticle] = []
+    seen: set[str] = set()
+    for raw_sig in signatures:
+        signature = str(raw_sig or "").strip()
+        if not signature or signature in seen:
+            continue
+        seen.add(signature)
+        result = law_retriever.retrieve(signature)
+        articles.append(_retrieved_article_from_result(signature, result))
+    return articles
+
+
+def retrieve_candidate_articles(
+    candidates: list[CandidateOffence],
+    law_retriever: LawClauseRetriever,
+) -> list[RetrievedLawArticle]:
+    signatures: list[str] = []
+    for candidate in candidates:
+        signature = candidate_signature(candidate)
+        if signature:
+            signatures.append(signature)
+        if candidate.Dieu and str(candidate.Dieu).strip() != signature:
+            signatures.append(str(candidate.Dieu).strip())
+    return retrieve_law_articles(signatures, law_retriever)
+
+
+def detect_offence_specific_supporting_articles(case_text: str, offence_text: str) -> list[str]:
+    text = _strip_accents(f"{case_text}\n{offence_text}").lower()
+    out: set[str] = set()
+    if any(term in text for term in ["tra lai", "boi thuong", "trach nhiem dan su", "khac phuc", "hoan tra"]):
+        out.update({"46", "48"})
+    if any(term in text for term in ["vat chung", "tich thu", "sung quy", "cong cu", "phuong tien"]):
+        out.update({"46", "47"})
+    if any(term in text for term in ["phap nhan thuong mai", "cong ty", "doanh nghiep"]):
+        out.add("76")
+    if any(term in text for term in ["duoi 18", "chua du 18", "nguoi duoi 18", "vi thanh nien"]):
+        out.update({"91", "101"})
+    return sorted(out, key=lambda item: int(item) if item.isdigit() else item)
+
+
+def retrieve_supporting_articles(
+    *,
+    case_text: str,
+    selected_offence_text: str,
+    law_retriever: LawClauseRetriever,
+) -> list[RetrievedLawArticle]:
+    optional = detect_offence_specific_supporting_articles(case_text, selected_offence_text)
+    signatures = list(MANDATORY_SUPPORTING_DIEU) + optional
+    return retrieve_law_articles(signatures, law_retriever)
+
+
+def classify_supporting_article_by_facts(
+    *,
+    article: str,
+    retrieved: RetrievedLawArticle | None,
+    case_text: str,
+) -> SupportingArticleAssessment:
+    if retrieved is None or not retrieved.found:
+        return SupportingArticleAssessment(
+            article=article,
+            status="not_retrieved",
+            factual_trigger=None,
+            explanation="Article was checked but not retrieved from raw_law.json.",
+        )
+
+    folded = _strip_accents(case_text).lower()
+    if article == "50":
+        return SupportingArticleAssessment(
+            article=article,
+            status="applicable",
+            factual_trigger="A penalty must be decided if the defendant is convicted.",
+            explanation="Article 50 is the general basis for deciding penalties.",
+        )
+    if article == "51":
+        has_mitigation = any(
+            term in folded
+            for term in ["thanh khan", "an nan", "boi thuong", "khac phuc", "dau thu", "tu thu", "nhan than tot"]
+        )
+        return SupportingArticleAssessment(
+            article=article,
+            status="applicable" if has_mitigation else "fact_dependent",
+            factual_trigger="Input mentions potential mitigating facts." if has_mitigation else None,
+            explanation="Article 51 applies only when mitigating circumstances are factually established.",
+        )
+    if article == "52":
+        has_aggravation = any(
+            term in folded
+            for term in ["pham toi 02 lan", "pham toi nhieu lan", "co to chuc", "tai pham", "con do", "loi dung"]
+        )
+        return SupportingArticleAssessment(
+            article=article,
+            status="applicable" if has_aggravation else "fact_dependent",
+            factual_trigger="Input mentions potential aggravating facts." if has_aggravation else None,
+            explanation="Article 52 applies only when aggravating circumstances are factually established.",
+        )
+    if article == "53":
+        has_recidivism = any(term in folded for term in ["tien an", "tien_an", "tai pham", "tai pham nguy hiem"])
+        clean_record = any(
+            term in folded
+            for term in ["tien an\": \"khong", "tien_an\": \"khong", "tien an: khong", "tien an khong"]
+        )
+        return SupportingArticleAssessment(
+            article=article,
+            status="fact_dependent" if has_recidivism and not clean_record else "not_applicable",
+            factual_trigger="Input mentions prior convictions or recidivism." if has_recidivism and not clean_record else None,
+            explanation="Article 53 is relevant only for recidivism or dangerous recidivism.",
+        )
+    if article == "47":
+        has_property = any(
+            term in folded
+            for term in ["vat chung", "tich thu", "sung quy", "cong cu", "phuong tien", "tra lai", "tai san", "tien"]
+        )
+        return SupportingArticleAssessment(
+            article=article,
+            status="fact_dependent" if has_property else "not_applicable",
+            factual_trigger="Input mentions money/property/evidence handling." if has_property else None,
+            explanation="Article 47 is relevant only when money/items directly related to the crime must be handled.",
+        )
+    if article == "58":
+        has_accomplice = any(term in folded for term in ["dong pham", "cung thuc hien", "giup suc", "chu muu", "nhieu bi cao"])
+        return SupportingArticleAssessment(
+            article=article,
+            status="fact_dependent" if has_accomplice else "not_applicable",
+            factual_trigger="Input mentions possible accomplice participation." if has_accomplice else None,
+            explanation="Article 58 applies in accomplice cases.",
+        )
+    if article in {"55", "56", "57", "54", "65", "38"}:
+        return SupportingArticleAssessment(
+            article=article,
+            status="fact_dependent",
+            factual_trigger=None,
+            explanation="Applicability depends on the selected sentence, procedural posture, or additional facts.",
+        )
+    return SupportingArticleAssessment(
+        article=article,
+        status="fact_dependent",
+        factual_trigger=None,
+        explanation="Offence-specific supporting article was retrieved and requires fact-specific assessment.",
+    )
+
+
+def ensure_mandatory_supporting_assessments(
+    assessments: list[SupportingArticleAssessment],
+    retrieved_supporting: list[RetrievedLawArticle],
+    *,
+    case_text: str = "",
+) -> list[SupportingArticleAssessment]:
+    by_article = {item.article: item for item in assessments if item.article}
+    retrieved_by_sig = {item.signature: item for item in retrieved_supporting}
+    for article in MANDATORY_SUPPORTING_DIEU:
+        if article in by_article:
+            continue
+        retrieved = retrieved_by_sig.get(article)
+        by_article[article] = classify_supporting_article_by_facts(
+            article=article,
+            retrieved=retrieved,
+            case_text=case_text,
+        )
+    return [by_article[key] for key in sorted(by_article, key=lambda value: int(value) if value.isdigit() else 9999)]
+
+
+def _verdict_items(data: dict[str, Any]) -> list[dict[str, Any]]:
+    items = data.get(VERDICT_FIELD)
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def _case_labels_contain_dieu(labels: dict[str, set[str]] | None, dieu: str | None) -> bool:
+    return bool(dieu and labels and str(dieu) in labels.get("dieu_only", set()))
+
+
+def _load_train_doc_map(train_dir: Path) -> dict[str, dict[str, Any]]:
+    docs: dict[str, dict[str, Any]] = {}
+    for path in sorted(train_dir.glob("*.json")):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            continue
+        docs[doc_id_from_case(data, path.stem)] = data
+    return docs
+
+
+def _sentence_for_selected_dieu(data: dict[str, Any], selected_dieu: str | None) -> str | None:
+    for item in _verdict_items(data):
+        basis = item.get("Can_Cu_Dieu_Luat")
+        if isinstance(basis, list):
+            for clause in basis:
+                if not isinstance(clause, dict):
+                    continue
+                if selected_dieu and str(clause.get("Dieu") or "").strip() == str(selected_dieu):
+                    return _normalize_space(item.get("Phat_Tu"))
+    for item in _verdict_items(data):
+        sentence = _normalize_space(item.get("Phat_Tu"))
+        if sentence:
+            return sentence
+    return None
+
+
+def _case_profile_text(data: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for field in ("Synthetic_summary", "Summary", "NOI_DUNG_VU_AN"):
+        value = data.get(field)
+        if isinstance(value, str):
+            parts.append(value[:2500])
+    verdict_profiles: list[str] = []
+    for item in _verdict_items(data):
+        for field in ("Tang_nang", "Giam_nhe", "Trach_Nhiem_Dan_Su", "Pham_Toi"):
+            value = item.get(field)
+            if value:
+                verdict_profiles.append(json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value)
+    parts.extend(verdict_profiles)
+    return "\n".join(parts)
+
+
+def _summarize_similar_case(data: dict[str, Any], doc_id: str, selected_dieu: str | None) -> SimilarCaseSummary:
+    profile = _case_profile_text(data)
+    mitigation_aggravation: list[str] = []
+    offences: list[str] = []
+    civil: list[str] = []
+    for item in _verdict_items(data):
+        if item.get("Pham_Toi"):
+            offences.append(json.dumps(item.get("Pham_Toi"), ensure_ascii=False))
+        if item.get("Tang_nang"):
+            mitigation_aggravation.append(f"Tăng nặng: {_normalize_space(item.get('Tang_nang'))}")
+        if item.get("Giam_nhe"):
+            mitigation_aggravation.append(f"Giảm nhẹ: {_normalize_space(item.get('Giam_nhe'))}")
+        if item.get("Trach_Nhiem_Dan_Su"):
+            civil.append(_normalize_space(item.get("Trach_Nhiem_Dan_Su")))
+    return SimilarCaseSummary(
+        doc_id=doc_id,
+        matched_offence_article=selected_dieu,
+        matched_factual_profile=_normalize_space(profile[:900]),
+        mitigation_aggravation_profile=_normalize_space("; ".join(mitigation_aggravation)[:900]) or None,
+        sentence=_sentence_for_selected_dieu(data, selected_dieu),
+        notable_reasoning=_normalize_space("; ".join(offences + civil)[:900]) or None,
+    )
+
+
+def retrieve_similar_cases(
+    *,
+    runtime: RetrievalRuntime,
+    train_dir: Path,
+    train_articles_index: dict[str, dict[str, set[str]]],
+    query_text: str,
+    selected_dieu: str | None,
+    exclude_doc_id: str | None,
+    broad_top_k: int = 64,
+    top_k: int = 5,
+) -> list[SimilarCaseSummary]:
+    if not query_text or not selected_dieu or top_k <= 0:
+        return []
+
+    results = runtime.query_train(
+        query_text=query_text,
+        top_k=broad_top_k,
+        exclude_doc_id=exclude_doc_id,
+        include=["metadatas", "distances"],
+    )
+    doc_scores: dict[str, float] = {}
+    for meta, distance in zip(results.get("metadatas", [[]])[0], results.get("distances", [[]])[0]):
+        if not isinstance(meta, dict):
+            continue
+        if str(meta.get("source_type", "")).lower() == "law":
+            continue
+        rid = str(meta.get("doc_id") or "").strip()
+        if not rid or not _case_labels_contain_dieu(train_articles_index.get(rid), selected_dieu):
+            continue
+        score = 1.0 - float(distance or 0.0)
+        doc_scores[rid] = max(score, doc_scores.get(rid, -999.0))
+
+    if not doc_scores:
+        return []
+
+    train_docs = _load_train_doc_map(train_dir)
+    query_tokens = _tokenize(query_text)
+    ranked: list[tuple[float, str]] = []
+    for rid, base_score in doc_scores.items():
+        data = train_docs.get(rid)
+        if not data:
+            continue
+        profile = _case_profile_text(data)
+        tokens = _tokenize(profile)
+        overlap = len(query_tokens & tokens) / max(len(query_tokens), 1)
+        has_sentence = 0.15 if _sentence_for_selected_dieu(data, selected_dieu) else 0.0
+        has_mitigation = 0.10 if re.search(r"Điều\s*51|dieu\s*51|Giam_nhe|Giảm nhẹ", profile, re.IGNORECASE) else 0.0
+        has_aggravation = 0.10 if re.search(r"Điều\s*52|dieu\s*52|Tang_nang|Tăng nặng", profile, re.IGNORECASE) else 0.0
+        ranked.append((base_score + overlap + has_sentence + has_mitigation + has_aggravation, rid))
+
+    ranked.sort(reverse=True)
+    return [_summarize_similar_case(train_docs[rid], rid, selected_dieu) for _, rid in ranked[:top_k]]
+
+
+def _call_llm(
+    *,
+    provider: LLMProvider | str,
+    model_name: str,
+    system_prompt: str,
+    user_prompt: str,
+    output_model: type[Any],
+    use_provider_fallback: bool,
+) -> tuple[Any, dict[str, Any]]:
+    if use_provider_fallback:
+        return generate_structured_output_with_fallback(
+            preferred_provider=provider,
+            model_name=model_name,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            output_model=output_model,
+        )
+    return generate_structured_output(
+        provider=provider,
+        model_name=model_name,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        output_model=output_model,
+    )
+
+
+def _candidate_prompt(doc_id: str, case_payload: dict[str, str]) -> tuple[str, str]:
+    system = "You are a Vietnamese criminal law analysis assistant. Return only valid JSON."
+    payload = {
+        "doc_id": doc_id,
+        "case_fields": case_payload,
+        "task": [
+            "Extract structured facts. Distinguish stated facts, conservative inferred facts, and missing facts.",
+            "Generate 2 to 5 plausible BLHS offence candidates.",
+            "Do not assume unknown facts are true.",
+            "Preserve defendant names exactly as provided.",
+        ],
+        "output_schema": build_output_schema_instruction(ReasonActAnalysisOutput),
+    }
+    return system, json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _legal_analysis_prompt(
+    *,
+    doc_id: str,
+    facts_and_candidates: ReasonActAnalysisOutput,
+    offence_articles: list[RetrievedLawArticle],
+    supporting_articles: list[RetrievedLawArticle],
+) -> tuple[str, str]:
+    system = "You are a Vietnamese criminal law judgment assistant. Return only valid JSON."
+    payload = {
+        "doc_id": doc_id,
+        "facts": facts_and_candidates.facts.model_dump(),
+        "candidates": [item.model_dump() for item in facts_and_candidates.candidates],
+        "retrieved_offence_articles": [item.model_dump() for item in offence_articles],
+        "retrieved_supporting_articles": [item.model_dump() for item in supporting_articles],
+        "rules": [
+            "Statutory law controls charge and sentencing-frame selection.",
+            "Select the likely offence and sentencing bracket from retrieved law only.",
+            "Reject or downgrade every non-selected candidate with a concise reason.",
+            "Classify every supporting article as applicable, fact_dependent, not_applicable, or not_retrieved.",
+            "For every supporting article status, explain the factual trigger.",
+            "Do not cite/apply a supporting article merely because it was retrieved.",
+            "Do not infer unknown facts as true.",
+        ],
+        "mandatory_supporting_articles": list(MANDATORY_SUPPORTING_DIEU),
+        "output_schema": build_output_schema_instruction(ReasonActLegalAnalysis),
+    }
+    return system, json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _final_prompt(
+    *,
+    doc_id: str,
+    case_payload: dict[str, str],
+    legal_analysis: ReasonActLegalAnalysis,
+    offence_articles: list[RetrievedLawArticle],
+    supporting_articles: list[RetrievedLawArticle],
+    similar_cases: list[SimilarCaseSummary],
+) -> tuple[str, str]:
+    system = "You are a Vietnamese criminal judgment prediction assistant. Return only valid JSON."
+    payload = {
+        "doc_id": doc_id,
+        "case_fields": case_payload,
+        "legal_analysis": legal_analysis.model_dump(),
+        "retrieved_offence_articles": [item.model_dump() for item in offence_articles if item.found],
+        "retrieved_supporting_articles": [item.model_dump() for item in supporting_articles],
+        "similar_cases_for_analogy_only": [item.model_dump() for item in similar_cases],
+        "rules": [
+            "Produce final prediction in GenerationOutput.",
+            "Include only actually applicable clauses in Applied_Law_Clauses.",
+            "Do not include checked-but-not-applicable or fact-dependent articles in Applied_Law_Clauses.",
+            "Use similar cases only for analogy and sentencing calibration, never to override statutory law.",
+            "Predict concrete Phat_Tu, additional fine, civil/property consequences, and Xu_Ly_Vat_Chung when supported.",
+            "For mitigation advice, only mention lawful cooperation, restitution, documentation, and procedural steps.",
+        ],
+        "output_schema": build_output_schema_instruction(ReasonActFinalOutput),
+    }
+    return system, json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def run_reasoning_act(
+    *,
+    data: dict[str, Any],
+    doc_id: str,
+    law_retriever: LawClauseRetriever,
+    case_runtime: RetrievalRuntime,
+    train_dir: Path,
+    train_articles_index: dict[str, dict[str, set[str]]] | None,
+    provider: LLMProvider | str,
+    model_name: str,
+    use_provider_fallback: bool = True,
+    input_fields: list[str] | None = None,
+    query_fields: list[str] | None = None,
+    broad_top_k_case: int = 64,
+    top_k_case: int = 5,
+) -> dict[str, Any]:
+    input_fields = input_fields or ["THONG_TIN_CHUNG.Thong_Tin_Bi_Cao", "Synthetic_summary"]
+    query_fields = query_fields or ["Synthetic_summary", "THONG_TIN_CHUNG.Thong_Tin_Bi_Cao"]
+    train_articles_index = train_articles_index if train_articles_index is not None else load_articles_index(train_dir)[0]
+
+    case_payload = extract_input_payload(data, input_fields)
+    query_text = build_query_text(data, query_fields)
+    case_text = "\n\n".join(case_payload.values())
+    usage: dict[str, Any] = {"calls": []}
+
+    system, user = _candidate_prompt(doc_id, case_payload)
+    facts_and_candidates, call_usage = _call_llm(
+        provider=provider,
+        model_name=model_name,
+        system_prompt=system,
+        user_prompt=user,
+        output_model=ReasonActAnalysisOutput,
+        use_provider_fallback=use_provider_fallback,
+    )
+    usage["calls"].append({"name": "facts_and_candidates", **call_usage})
+
+    offence_articles = retrieve_candidate_articles(facts_and_candidates.candidates, law_retriever)
+    found_offence_text = "\n\n".join(item.text or "" for item in offence_articles if item.found)
+    supporting_articles = retrieve_supporting_articles(
+        case_text="\n\n".join(case_payload.values()),
+        selected_offence_text=found_offence_text,
+        law_retriever=law_retriever,
+    )
+
+    system, user = _legal_analysis_prompt(
+        doc_id=doc_id,
+        facts_and_candidates=facts_and_candidates,
+        offence_articles=offence_articles,
+        supporting_articles=supporting_articles,
+    )
+    legal_analysis, call_usage = _call_llm(
+        provider=provider,
+        model_name=model_name,
+        system_prompt=system,
+        user_prompt=user,
+        output_model=ReasonActLegalAnalysis,
+        use_provider_fallback=use_provider_fallback,
+    )
+    legal_analysis.supporting_article_assessments = ensure_mandatory_supporting_assessments(
+        legal_analysis.supporting_article_assessments,
+        supporting_articles,
+        case_text=case_text,
+    )
+    usage["calls"].append({"name": "legal_analysis", **call_usage})
+
+    selected_dieu = legal_analysis.selected_offence.Dieu
+    if selected_dieu and all(item.signature != selected_dieu for item in offence_articles):
+        offence_articles.extend(retrieve_law_articles([selected_dieu], law_retriever))
+
+    similar_cases = retrieve_similar_cases(
+        runtime=case_runtime,
+        train_dir=train_dir,
+        train_articles_index=train_articles_index,
+        query_text=query_text,
+        selected_dieu=selected_dieu,
+        exclude_doc_id=doc_id,
+        broad_top_k=broad_top_k_case,
+        top_k=top_k_case,
+    )
+
+    system, user = _final_prompt(
+        doc_id=doc_id,
+        case_payload=case_payload,
+        legal_analysis=legal_analysis,
+        offence_articles=offence_articles,
+        supporting_articles=supporting_articles,
+        similar_cases=similar_cases,
+    )
+    final_output, call_usage = _call_llm(
+        provider=provider,
+        model_name=model_name,
+        system_prompt=system,
+        user_prompt=user,
+        output_model=ReasonActFinalOutput,
+        use_provider_fallback=use_provider_fallback,
+    )
+    usage["calls"].append({"name": "final_prediction", **call_usage})
+
+    trace = ReasonActTrace(
+        facts=facts_and_candidates.facts,
+        candidates=facts_and_candidates.candidates,
+        selected_offence=final_output.legal_analysis.selected_offence,
+        rejected_candidates=final_output.legal_analysis.rejected_candidates,
+        retrieved_offence_articles=offence_articles,
+        retrieved_supporting_articles=supporting_articles,
+        supporting_article_assessments=ensure_mandatory_supporting_assessments(
+            final_output.legal_analysis.supporting_article_assessments,
+            supporting_articles,
+            case_text=case_text,
+        ),
+        similar_cases=similar_cases,
+        sentencing_bracket=final_output.legal_analysis.sentencing_bracket,
+        confidence=final_output.legal_analysis.confidence,
+        missing_facts=final_output.legal_analysis.missing_facts,
+    )
+    return {
+        "prediction": final_output.prediction,
+        "trace": trace,
+        "usage": usage,
+        "llm_input_payload": case_payload,
+    }
+
+
+def safe_run_reasoning_act(**kwargs: Any) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        return run_reasoning_act(**kwargs), None
+    except (ValidationError, json.JSONDecodeError) as exc:
+        return None, f"parse_error: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return None, f"generation_error: {exc}"

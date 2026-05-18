@@ -4,13 +4,14 @@ Workflow per test case:
 1. Build a query text from selected case fields.
 2. Retrieve top-k similar past cases from the train index.
 3. Union their law clauses, aggregate to unique Dieu list, and fetch explicit Dieu text.
-4. Prompt an LLM to predict, per defendant:
+4. Load the narrative text and judicial reasoning of the top 2 retrieved past cases.
+5. Prompt an LLM to predict, per defendant:
    - applied law clauses
    - Toi_Danh
    - Phat_Tu
    - Trach_Nhiem_Dan_Su
-5. Compare predictions against ground truth verdict fields.
-6. Save a single JSON report with per-document details and aggregate metrics.
+6. Compare predictions against ground truth verdict fields.
+7. Save a single JSON report with per-document details and aggregate metrics.
 """
 
 from __future__ import annotations
@@ -50,6 +51,9 @@ from rag.generation.schemas import GenerationOutput, build_output_schema_instruc
 from rag.runtime.retrieval import RetrievalRuntime, RetrievalRuntimeConfig
 
 load_dotenv()
+
+# Always treat these core BLHS Dieu as present in retrieved law-clause candidates.
+ALWAYS_INCLUDE_DIEU = ("51", "52", "47", "38", "55", "56")
 
 
 def _normalize_space(text: str) -> str:
@@ -109,14 +113,12 @@ def _extract_doc_id(data: dict[str, Any], fallback: str) -> str:
 
 def _extract_input_payload(data: dict[str, Any], fields: list[str]) -> dict[str, str]:
     def _resolve_field_value(field: str) -> Any:
-        # Friendly aliases for nested defendant information in THONG_TIN_CHUNG.
         if field in {"Defendant_info", "defendant_info", "Thong_Tin_Bi_Cao"}:
             info = data.get("THONG_TIN_CHUNG")
             if isinstance(info, dict):
                 return info.get("Thong_Tin_Bi_Cao")
             return None
 
-        # Support dotted nested path access, e.g. THONG_TIN_CHUNG.Thong_Tin_Bi_Cao.
         if "." in field:
             cur: Any = data
             for part in field.split("."):
@@ -340,6 +342,34 @@ def _retrieve_similar_case_doc_ids(
         n_fetch = min(n_fetch * 2, cap)
 
 
+def _build_past_cases_context(
+    case_doc_ids: list[str],
+    train_dir: Path,
+    max_cases: int = 2
+) -> list[dict[str, Any]]:
+    """Loads the summary and verdict of top retrieved cases to use as reasoning examples."""
+    past_cases = []
+    for doc_id in case_doc_ids[:max_cases]:
+        file_path = train_dir / f"{doc_id}.json"
+        if not file_path.exists():
+            continue
+        
+        try:
+            with open(file_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+                
+            past_cases.append({
+                "doc_id": doc_id,
+                "Case_Summary": data.get("Summary") or data.get("Synthetic_summary", ""),
+                "Court_Reasoning": data.get("NHAN_DINH_CUA_TOA_AN", {}),
+                "Verdict": data.get("PHAN_QUYET_CUA_TOA_SO_THAM", [])
+            })
+        except Exception:
+            continue
+            
+    return past_cases
+
+
 def _build_similar_case_clause_context(
     *,
     case_doc_ids: list[str],
@@ -396,10 +426,11 @@ def _build_prompts(
     case_payload: dict[str, str],
     defendant_info: str,
     explicit_law_clauses: list[dict[str, str]],
+    past_cases_context: list[dict[str, Any]],
 ) -> tuple[str, str]:
     system_prompt = (
         "You are an expert Vietnamese criminal judgment assistant. "
-        "Return only valid JSON. Predict legal outcomes strictly from provided facts and law clauses."
+        "Return only valid JSON. Predict legal outcomes strictly from provided facts, law clauses, and judicial precedents. "
     )
 
     requirements = [
@@ -411,6 +442,8 @@ def _build_prompts(
         "Predict Trach_Nhiem_Dan_Su when applicable.",
         "Use explicit_law_clauses (retrieved at Dieu level from similar past cases) as legal references and select only applicable clauses.",
         "Before producing output, reason from the provided case_fields, Defendant_info, and explicit_law_clauses.",
+        "MANDATORY: You must evaluate and include applicable general sentencing provisions from the 50s articles (e.g., Article 51 for mitigating factors, Article 52 for aggravating factors, Articles 55/56 for sentence synthesis) in Applied_Law_Clauses.",
+        "MANDATORY: You must compare the current case facts against the provided 'past_cases_context'. Use the judicial reasoning (NHAN_DINH_CUA_TOA_AN) of past cases to determine the correct Toi_Danh and Phat_Tu."
     ]
     constraints = [
         "No markdown, no extra explanation.",
@@ -425,36 +458,18 @@ def _build_prompts(
         "case_fields": case_payload,
         "Defendant_info": defendant_info,
         "explicit_law_clauses": explicit_law_clauses,
+        "past_cases_context": past_cases_context,
         "task": {
             "requirement": requirements,
             "reasoning_instruction": [
                 "Use the factual timeline in case_fields to identify offense behavior.",
                 "Use Defendant_info for circumstances that affect sentencing and mitigating/aggravating factors.",
                 "Select applicable clauses from explicit_law_clauses before deciding Toi_Danh and Phat_Tu.",
+                "When calculating the final Phat_Tu, you must explicitly adjust the sentence length based on the presence of mitigating factors (Article 51), aggravating factors (Article 52), or previous convictions/synthesis (Articles 55/56) found in Defendant_info.",
+                "Analyze 'past_cases_context'. Compare weapons, intent, and severity in the past cases to the current case.",
+                "If the current facts closely mirror a past case, align your Toi_Danh and Phat_Tu predictions with that past case, adjusting for specific aggravating/mitigating factors."
             ],
             "output_schema": build_output_schema_instruction(GenerationOutput),
-            "output_schema_example": {
-                "defendants": [
-                    {
-                        "Bi_Cao": "Nguyen Van A",
-                        "Phan_Tich_Phap_Ly": "Tóm tắt phân tích pháp lý ngắn gọn dựa trên sự kiện được cung cấp.",
-                        "Toi_Danh": "Trộm cắp tài sản",
-                        "Applied_Law_Clauses": [
-                            {
-                                "Dieu": "173",
-                                "Khoan": "1",
-                                "Diem": "a",
-                                "Tinh_tiet_ap_dung": "Lấy trộm điện thoại từ túi nạn nhân",
-                                "Bo_Luat_Va_Van_Ban_Khac": "BLHS"
-                            }
-                        ],
-                        "Phat_Tu": "6 tháng tù",
-                        "Phat_Tien": None,
-                        "Trach_Nhiem_Dan_Su": None,
-                        "Xu_Ly_Vat_Chung": None,
-                    }
-                ]
-            },
             "constraints": constraints,
         },
     }
@@ -476,6 +491,7 @@ def _evaluate_single_doc(
     model_name: str,
     only_blhs: bool,
     use_provider_fallback: bool,
+    train_dir: Path,
 ) -> dict[str, Any]:
     doc_id = _extract_doc_id(data, path.stem)
     case_payload = _extract_input_payload(data, input_fields)
@@ -501,13 +517,25 @@ def _evaluate_single_doc(
         exclude_doc_id=doc_id,
         top_k_case=top_k_case,
     )
+    
     similar_case_context = _build_similar_case_clause_context(
         case_doc_ids=similar_case_doc_ids,
         train_articles_index=train_articles_index,
     )
 
+    # Fetch narrative context for the top 2 cases
+    past_cases_context = _build_past_cases_context(
+        case_doc_ids=similar_case_doc_ids,
+        train_dir=train_dir,
+        max_cases=2
+    )
+
+    forced_clause_set = set(similar_case_context.get("similar_case_law_clause_set", []))
+    forced_clause_set |= set(ALWAYS_INCLUDE_DIEU)
+    similar_case_context["similar_case_law_clause_set"] = sorted(forced_clause_set)
+
     explicit_law_clauses = _retrieve_explicit_law_by_dieu(
-        law_signatures=set(similar_case_context.get("similar_case_law_clause_set", [])),
+        law_signatures=forced_clause_set,
         law_retriever=law_retriever,
     )
 
@@ -521,6 +549,7 @@ def _evaluate_single_doc(
         case_payload=case_payload,
         defendant_info=defendant_info,
         explicit_law_clauses=explicit_law_clauses,
+        past_cases_context=past_cases_context,
     )
 
     usage: dict[str, Any] = {}
@@ -713,7 +742,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate verdict generation and law-clause filtering using test cases, "
-            "law embedding retrieval, and LLM generation."
+            "law embedding retrieval, fixed system-law priors, and LLM generation."
         )
     )
     parser.add_argument("--test-dir", default="chunk/test", help="Directory with test JSON files")
@@ -721,7 +750,7 @@ def main() -> None:
     parser.add_argument("--law-json", default="raw_law.json", help="Path to raw law JSON used for embedding")
     parser.add_argument("--case-db-dir", default="output/generation_eval/case_db", help="Case Chroma DB directory")
     parser.add_argument("--law-db-dir", default="output/generation_eval/law_db", help="Law Chroma DB directory")
-    parser.add_argument("--results-out", default="output/generation_eval/verdict_generation_eval.json")
+    parser.add_argument("--results-out", default="output/generation_eval/verdict_generation_system_eval.json")
     parser.add_argument("--provider", choices=[p.value for p in LLMProvider], default="openrouter")
     parser.add_argument("--model", default=None, help="Provider model override")
     parser.add_argument("--embed-model", default=DEFAULT_MODEL_NAME, help="Embedding model for law retrieval")
@@ -845,7 +874,8 @@ def main() -> None:
     print(f"Input fields={input_fields}")
     print(f"Query fields={query_fields}")
     print(f"Train embedding fields={train_embedding_fields}")
-    print("Past-case retrieval enabled for law candidate mining (not passed as narrative context to LLM)")
+    print(f"Always-included Dieu={list(ALWAYS_INCLUDE_DIEU)}")
+    print("Past-case retrieval enabled for law candidate mining and context (passed as narrative context to LLM)")
     print(f"Law retriever dieu index size={len(getattr(law_retriever, '_dieu_index', {}))}")
     print(f"Train label index size={len(train_articles_index)} (skipped={len(train_skipped)})")
 
@@ -866,6 +896,7 @@ def main() -> None:
             model_name=model_name,
             only_blhs=args.only_blhs,
             use_provider_fallback=use_provider_fallback,
+            train_dir=train_dir,
         )
         per_doc.append(result)
         print(f"{result['status']}: {path.name} ({result.get('reason', '')})")
@@ -889,6 +920,7 @@ def main() -> None:
             "input_fields": input_fields,
             "query_fields": query_fields,
             "train_embedding_fields": train_embedding_fields,
+            "always_include_dieu": list(ALWAYS_INCLUDE_DIEU),
             "only_blhs": args.only_blhs,
             "n_train_label_index": len(train_articles_index),
             "n_train_label_skipped": len(train_skipped),
@@ -907,7 +939,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-"""
-/home/hieujayce/Downloads/complete_repo/.venv/bin/python -m rag.evaluation.generation_eval --test-dir chunk/test --train-dir chunk/train --law-json raw_law.json --first-n 5 --results-out output/generation_eval/verdict_generation_eval_first5.json
-"""

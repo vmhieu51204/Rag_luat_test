@@ -25,10 +25,14 @@ Usage
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
 from pathlib import Path
+
+# Set HuggingFace cache directory BEFORE any imports that might use it
+os.environ['HF_HOME'] = '/home/hieujayce/huggingface_cache'
 
 from rag.config import (
     DEFAULT_BATCH_SIZE,
@@ -85,11 +89,32 @@ def chunk_document(
     max_chunk_chars: int = MAX_CHUNK_CHARS,
 ) -> list[dict]:
     """Produce chunk records from a single JSON document."""
+    def resolve_field_value(field: str):
+        if "." not in field:
+            return data.get(field)
+        cur = data
+        for part in field.split("."):
+            if isinstance(cur, dict):
+                cur = cur.get(part)
+                continue
+            if isinstance(cur, list):
+                values = [item.get(part) for item in cur if isinstance(item, dict) and item.get(part) is not None]
+                cur = values
+                continue
+            return None
+        return cur
+
     fields = content_fields or CONTENT_FIELDS
     doc_id = data.get(ID_FIELD, Path(source_file).stem)
     chunks = []
     for field in fields:
-        raw = (data.get(field) or "").strip()
+        value = resolve_field_value(field)
+        if value is None:
+            raw = ""
+        elif isinstance(value, str):
+            raw = value.strip()
+        else:
+            raw = json.dumps(value, ensure_ascii=False).strip()
         if not raw:
             continue
         sub_chunks = split_text(raw, max_chunk_chars)
@@ -148,6 +173,11 @@ def load_model(model_name: str = MODEL_NAME, device: str = DEVICE):
     except ImportError:
         print("[ERROR] Run: pip install sentence-transformers")
         sys.exit(1)
+    
+    # Create cache directory if it doesn't exist
+    cache_dir = os.environ.get('HF_HOME', '/home/hieujayce/huggingface_cache')
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    
     print(f"  Loading {model_name} on {device} ...")
     model = SentenceTransformer(model_name, device=device)
     print(f"  Embedding dim: {model.get_sentence_embedding_dimension()}")

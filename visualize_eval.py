@@ -39,8 +39,7 @@ from matplotlib.colors import LinearSegmentedColormap
 # ── Configuration — edit these paths / constants ─────────────────────────────
 
 RESULTS_FILES = {
-    "top_k=5":  "output/eval_results_top5.json",
-    "top_k=10": "output/eval_results_top10.json",
+    "top_k=5":  "output/generation_eval/f5_system.json",
 }
 
 # Which run to use for clause-level charts (sections 3-6)
@@ -86,22 +85,103 @@ def style_ax(ax: plt.Axes, *, xlabel="", ylabel="", title="") -> None:
     ax.grid(axis="y", linestyle="--", alpha=0.4)
 
 
+def is_generation_eval_format(data: dict) -> bool:
+    return "summary" in data and "metrics" in data.get("summary", {})
+
+
+def get_n_docs(data: dict) -> int:
+    if "n_docs" in data:
+        return int(data["n_docs"])
+    summary = data.get("summary", {})
+    return int(summary.get("n_processed", summary.get("n_total", 0)))
+
+
+def get_macro_metrics(data: dict) -> dict[str, float]:
+    if is_generation_eval_format(data):
+        m = data.get("summary", {}).get("metrics", {})
+        p = float(m.get("law_clause_set_precision_macro", 0.0))
+        r = float(m.get("law_clause_set_recall_macro", 0.0))
+        f1 = float(m.get("law_clause_set_f1_macro", 0.0))
+        # generation_eval judges law clauses at dieu-level, so mirror values.
+        return {
+            "macro_precision": p,
+            "macro_recall": r,
+            "macro_f1": f1,
+            "macro_precision_dieu": p,
+            "macro_recall_dieu": r,
+            "macro_f1_dieu": f1,
+        }
+    return {
+        "macro_precision": float(data.get("macro_precision", 0.0)),
+        "macro_recall": float(data.get("macro_recall", 0.0)),
+        "macro_f1": float(data.get("macro_f1", 0.0)),
+        "macro_precision_dieu": float(data.get("macro_precision_dieu", 0.0)),
+        "macro_recall_dieu": float(data.get("macro_recall_dieu", 0.0)),
+        "macro_f1_dieu": float(data.get("macro_f1_dieu", 0.0)),
+    }
+
+
+def _clause_set_from_party(item: dict | None) -> set[str]:
+    if not isinstance(item, dict):
+        return set()
+    clauses = item.get("Applied_Law_Clauses") or []
+    return {str(c).strip() for c in clauses if str(c).strip()}
+
+
+def _doc_clause_sets_generation(doc: dict) -> tuple[set[str], set[str]]:
+    gt: set[str] = set()
+    pred: set[str] = set()
+    for d in doc.get("defendants", []):
+        if not isinstance(d, dict):
+            continue
+        gt |= _clause_set_from_party(d.get("ground_truth"))
+        pred |= _clause_set_from_party(d.get("prediction"))
+    return gt, pred
+
+
 def per_doc_df(data: dict) -> pd.DataFrame:
     rows = []
+    if not data.get("per_doc"):
+        return pd.DataFrame(rows)
+
+    first_doc = data["per_doc"][0]
+    retrieval_like = isinstance(first_doc, dict) and "precision" in first_doc
+
     for doc in data["per_doc"]:
+        if retrieval_like:
+            rows.append({
+                "doc_id":           doc["doc_id"],
+                "precision":        doc["precision"],
+                "recall":           doc["recall"],
+                "f1":               doc["f1"],
+                "precision_dieu":   doc["precision_dieu"],
+                "recall_dieu":      doc["recall_dieu"],
+                "f1_dieu":          doc["f1_dieu"],
+                "n_gt":             len(doc["ground_truth"]),
+                "n_predicted":      len(doc["predicted_articles"]),
+                "n_matched":        len(doc["matched_articles"]),
+                "n_missed":         len(doc["missed_articles"]),
+                "n_extra":          len(doc["extra_articles"]),
+            })
+            continue
+
+        if doc.get("status") != "processed":
+            continue
+        dm = doc.get("doc_metrics", {})
+        gt_set, pred_set = _doc_clause_sets_generation(doc)
         rows.append({
-            "doc_id":           doc["doc_id"],
-            "precision":        doc["precision"],
-            "recall":           doc["recall"],
-            "f1":               doc["f1"],
-            "precision_dieu":   doc["precision_dieu"],
-            "recall_dieu":      doc["recall_dieu"],
-            "f1_dieu":          doc["f1_dieu"],
-            "n_gt":             len(doc["ground_truth"]),
-            "n_predicted":      len(doc["predicted_articles"]),
-            "n_matched":        len(doc["matched_articles"]),
-            "n_missed":         len(doc["missed_articles"]),
-            "n_extra":          len(doc["extra_articles"]),
+            "doc_id":         doc.get("doc_id", ""),
+            "precision":      float(dm.get("law_clause_precision_macro", 0.0)),
+            "recall":         float(dm.get("law_clause_recall_macro", 0.0)),
+            "f1":             float(dm.get("law_clause_f1_macro", 0.0)),
+            "precision_dieu": float(dm.get("law_clause_precision_macro", 0.0)),
+            "recall_dieu":    float(dm.get("law_clause_recall_macro", 0.0)),
+            "f1_dieu":        float(dm.get("law_clause_f1_macro", 0.0)),
+            "n_gt":           len(gt_set),
+            "n_predicted":    len(pred_set),
+            "n_matched":      len(gt_set & pred_set),
+            "n_missed":       len(gt_set - pred_set),
+            "n_extra":        len(pred_set - gt_set),
         })
     return pd.DataFrame(rows)
 
@@ -111,10 +191,26 @@ def clause_counters(data: dict) -> tuple[Counter, Counter, Counter]:
     missed_ctr:  Counter = Counter()
     extra_ctr:   Counter = Counter()
     popular_ctr: Counter = Counter()
+
+    if not data.get("per_doc"):
+        return missed_ctr, extra_ctr, popular_ctr
+
+    first_doc = data["per_doc"][0]
+    retrieval_like = isinstance(first_doc, dict) and "missed_articles" in first_doc
+
     for doc in data["per_doc"]:
-        missed_ctr.update(doc["missed_articles"])
-        extra_ctr.update(doc["extra_articles"])
-        popular_ctr.update(doc["ground_truth"])
+        if retrieval_like:
+            missed_ctr.update(doc["missed_articles"])
+            extra_ctr.update(doc["extra_articles"])
+            popular_ctr.update(doc["ground_truth"])
+            continue
+
+        if doc.get("status") != "processed":
+            continue
+        gt_set, pred_set = _doc_clause_sets_generation(doc)
+        missed_ctr.update(gt_set - pred_set)
+        extra_ctr.update(pred_set - gt_set)
+        popular_ctr.update(gt_set)
     return missed_ctr, extra_ctr, popular_ctr
 
 
@@ -137,10 +233,11 @@ missed_ctr, extra_ctr, popular_ctr = clause_counters(primary_data)
 
 print(f"Loaded {len(results)} run(s): {list(results)}")
 for label, data in results.items():
-    print(f"  [{label}] n_docs={data['n_docs']}  "
-          f"P={data['macro_precision']:.4f}  "
-          f"R={data['macro_recall']:.4f}  "
-          f"F1={data['macro_f1']:.4f}")
+    metrics = get_macro_metrics(data)
+    print(f"  [{label}] n_docs={get_n_docs(data)}  "
+          f"P={metrics['macro_precision']:.4f}  "
+          f"R={metrics['macro_recall']:.4f}  "
+          f"F1={metrics['macro_f1']:.4f}")
 
 # %% [markdown]
 # ## Section 1 — Global macro metrics comparison
@@ -158,7 +255,8 @@ width   = 0.8 / max(n_runs, 1)
 fig, ax = plt.subplots(figsize=(13, 5))
 
 for i, (label, data) in enumerate(results.items()):
-    vals   = [data[k] for k in metric_keys]
+    metrics = get_macro_metrics(data)
+    vals   = [metrics[k] for k in metric_keys]
     offset = (i - (n_runs - 1) / 2) * width
     bars   = ax.bar(x + offset, vals, width=width * 0.9,
                     label=label, color=PALETTE.get(label, f"C{i}"),
@@ -204,8 +302,9 @@ plt.show()
 
 print(f"\nTop {TOP_N} missed clauses (full_signature level):")
 for clause, cnt in top_missed:
-    pct = 100 * cnt / primary_data["n_docs"]
-    print(f"  {clause:<20}  missed in {cnt:>3} / {primary_data['n_docs']} docs  ({pct:.1f}%)")
+    n_docs = max(get_n_docs(primary_data), 1)
+    pct = 100 * cnt / n_docs
+    print(f"  {clause:<20}  missed in {cnt:>3} / {n_docs} docs  ({pct:.1f}%)")
 
 # %% [markdown]
 # ## Section 4 — Top-N redundant (extra) clauses
@@ -235,8 +334,9 @@ plt.show()
 
 print(f"\nTop {TOP_N} redundant clauses (full_signature level):")
 for clause, cnt in top_extra:
-    pct = 100 * cnt / primary_data["n_docs"]
-    print(f"  {clause:<20}  extra in  {cnt:>3} / {primary_data['n_docs']} docs  ({pct:.1f}%)")
+    n_docs = max(get_n_docs(primary_data), 1)
+    pct = 100 * cnt / n_docs
+    print(f"  {clause:<20}  extra in  {cnt:>3} / {n_docs} docs  ({pct:.1f}%)")
 
 # %% [markdown]
 # ## Section 5 — Top-N most popular ground-truth clauses
