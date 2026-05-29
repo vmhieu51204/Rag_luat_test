@@ -89,44 +89,70 @@ def chunk_document(
     max_chunk_chars: int = MAX_CHUNK_CHARS,
 ) -> list[dict]:
     """Produce chunk records from a single JSON document."""
-    def resolve_field_value(field: str):
+    def resolve_field_records(field: str) -> list[dict]:
         if "." not in field:
-            return data.get(field)
-        cur = data
-        for part in field.split("."):
+            return [{"value": data.get(field), "metadata": {}}]
+
+        def walk(cur, parts: list[str], metadata: dict) -> list[dict]:
+            if not parts:
+                return [{"value": cur, "metadata": metadata}]
+
+            part = parts[0]
+            rest = parts[1:]
             if isinstance(cur, dict):
-                cur = cur.get(part)
-                continue
+                if part not in cur:
+                    return []
+                return walk(cur.get(part), rest, metadata)
+
             if isinstance(cur, list):
-                values = [item.get(part) for item in cur if isinstance(item, dict) and item.get(part) is not None]
-                cur = values
-                continue
-            return None
-        return cur
+                records = []
+                for idx, item in enumerate(cur):
+                    if not isinstance(item, dict) or part not in item:
+                        continue
+                    item_metadata = {**metadata, "record_index": idx}
+                    defendant_name = item.get("Bi_Cao")
+                    if isinstance(defendant_name, str) and defendant_name.strip():
+                        item_metadata["defendant_name"] = defendant_name.strip()
+                    records.extend(walk(item.get(part), rest, item_metadata))
+                return records
+
+            return []
+
+        return walk(data, field.split("."), {})
 
     fields = content_fields or CONTENT_FIELDS
     doc_id = data.get(ID_FIELD, Path(source_file).stem)
     chunks = []
     for field in fields:
-        value = resolve_field_value(field)
-        if value is None:
-            raw = ""
-        elif isinstance(value, str):
-            raw = value.strip()
-        else:
-            raw = json.dumps(value, ensure_ascii=False).strip()
-        if not raw:
-            continue
-        sub_chunks = split_text(raw, max_chunk_chars)
-        for idx, text in enumerate(sub_chunks):
-            chunks.append({
-                "doc_id":                 doc_id,
-                "source_file":            source_file,
-                "field":                  field,
-                "chunk_index":            idx,
-                "total_chunks_for_field": len(sub_chunks),
-                "text":                   text,
-            })
+        chunk_index = 0
+        field_chunks = []
+        for record in resolve_field_records(field):
+            value = record["value"]
+            if value is None:
+                raw = ""
+            elif isinstance(value, str):
+                raw = value.strip()
+            else:
+                raw = json.dumps(value, ensure_ascii=False).strip()
+            if not raw:
+                continue
+            sub_chunks = split_text(raw, max_chunk_chars)
+            for local_idx, text in enumerate(sub_chunks):
+                field_chunks.append({
+                    "doc_id":                 doc_id,
+                    "source_file":            source_file,
+                    "field":                  field,
+                    "chunk_index":            chunk_index,
+                    "record_chunk_index":     local_idx,
+                    "total_chunks_for_record": len(sub_chunks),
+                    "text":                   text,
+                    **record["metadata"],
+                })
+                chunk_index += 1
+        total_chunks_for_field = len(field_chunks)
+        for chunk in field_chunks:
+            chunk["total_chunks_for_field"] = total_chunks_for_field
+        chunks.extend(field_chunks)
     return chunks
 
 
@@ -234,15 +260,29 @@ def embed_chunks(
     model = load_model(model_name=model_name, device=device)
     collection = load_chroma(db_dir, collection_name=collection_name, create=True)
 
-    ids       = [f"{c['doc_id']}__{c['field']}__{c['chunk_index']:03d}" for c in chunks]
+    def chunk_id(chunk: dict) -> str:
+        record_part = ""
+        if "record_index" in chunk:
+            record_part = f"__record_{chunk['record_index']:03d}"
+        return f"{chunk['doc_id']}__{chunk['field']}{record_part}__{chunk['chunk_index']:03d}"
+
+    ids       = [chunk_id(c) for c in chunks]
     texts     = [c["text"] for c in chunks]
-    metadatas = [{
-        "doc_id":                 c["doc_id"],
-        "source_file":            c["source_file"],
-        "field":                  c["field"],
-        "chunk_index":            c["chunk_index"],
-        "total_chunks_for_field": c["total_chunks_for_field"],
-    } for c in chunks]
+    metadatas = []
+    for c in chunks:
+        metadata = {
+            "doc_id":                 c["doc_id"],
+            "source_file":            c["source_file"],
+            "field":                  c["field"],
+            "chunk_index":            c["chunk_index"],
+            "record_chunk_index":     c.get("record_chunk_index", c["chunk_index"]),
+            "total_chunks_for_record": c.get("total_chunks_for_record", c["total_chunks_for_field"]),
+            "total_chunks_for_field": c["total_chunks_for_field"],
+        }
+        for key in ("record_index", "defendant_name"):
+            if key in c:
+                metadata[key] = c[key]
+        metadatas.append(metadata)
 
     # Skip already-embedded chunks (safe to re-run / resume)
     existing  = set(collection.get(ids=ids)["ids"])
@@ -256,25 +296,21 @@ def embed_chunks(
     texts_new = [texts[i]     for i in new_mask]
     meta_new  = [metadatas[i] for i in new_mask]
 
-    t0, all_vecs = time.time(), []
+    t0 = time.time()
     for start in range(0, len(texts_new), batch_size):
         batch = texts_new[start : start + batch_size]
         vecs  = model.encode(batch, normalize_embeddings=True, show_progress_bar=False)
-        all_vecs.extend(vecs.tolist())
+        end = start + len(batch)
+        collection.upsert(
+            ids=ids_new[start:end],
+            embeddings=vecs.tolist(),
+            documents=texts_new[start:end],
+            metadatas=meta_new[start:end],
+        )
         done = min(start + batch_size, len(texts_new))
         print(f"  {done}/{len(texts_new)} — {time.time()-t0:.1f}s", end="\r")
 
-    print(f"\n  Embedding done in {time.time()-t0:.1f}s")
-
-    CHROMA_BATCH = 500
-    for start in range(0, len(ids_new), CHROMA_BATCH):
-        sl = slice(start, start + CHROMA_BATCH)
-        collection.upsert(
-            ids=ids_new[sl],
-            embeddings=all_vecs[sl],
-            documents=texts_new[sl],
-            metadatas=meta_new[sl],
-        )
+    print(f"\n  Embedding and upsert done in {time.time()-t0:.1f}s")
 
     print(f"  ✅ ChromaDB '{collection_name}' now has {collection.count()} documents.")
 

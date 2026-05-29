@@ -18,7 +18,7 @@ from rag.config import (
 )
 from rag.core.embeddings import run_pipeline
 from rag.core.law_retriever import LawClauseRetriever
-from rag.evaluation.generation_system_eval import (
+from rag.evaluation.eval_utils import (
     _aggregate,
     _compact_defendant_item,
     _extract_doc_id,
@@ -31,11 +31,14 @@ from rag.evaluation.generation_system_eval import (
     _safe_float,
     _set_prf,
     _to_dieu_set,
+    load_articles_index,
+    save_eval_results,
 )
-from rag.evaluation.retrieval_eval import load_articles_index
 from rag.generation.reasoning_act import (
     DEFAULT_REASON_ACT_TRAIN_FIELDS,
+    DEFAULT_SENTENCING_CALIBRATION_FIELDS,
     MANDATORY_SUPPORTING_DIEU,
+    SYNTHETIC_SUMMARY_FORMAT_NOTE,
     safe_run_reasoning_act,
 )
 from rag.llm.providers import LLMProvider, default_model_for_provider
@@ -172,6 +175,14 @@ def _evaluate_single_doc(
         "similar_case_context": {
             "similar_case_doc_ids": [item.get("doc_id") for item in trace_dict.get("similar_cases", [])],
         },
+        "sentencing_calibration_context": {
+            "mitigation_factors": trace_dict.get("mitigation_factors", []),
+            "aggravation_factors": trace_dict.get("aggravation_factors", []),
+            "calibration_case_doc_ids": [
+                item.get("doc_id") for item in trace_dict.get("sentencing_calibration_cases", [])
+            ],
+            "calibration_cases": trace_dict.get("sentencing_calibration_cases", []),
+        },
         "retrieved_law": {
             "offence_articles": trace_dict.get("retrieved_offence_articles", []),
             "supporting_articles": trace_dict.get("retrieved_supporting_articles", []),
@@ -216,7 +227,10 @@ def main() -> None:
     parser.add_argument(
         "--input-fields",
         default="THONG_TIN_CHUNG.Thong_Tin_Bi_Cao,Synthetic_summary",
-        help="Comma-separated fields passed to the ReAct LLM prompts.",
+        help=(
+            "Comma-separated fields passed to the ReAct LLM prompts. "
+            "Synthetic_summary may be a list of separate first-person defendant stories."
+        ),
     )
     parser.add_argument(
         "--query-fields",
@@ -225,10 +239,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--train-embedding-fields",
-        default=",".join(DEFAULT_REASON_ACT_TRAIN_FIELDS + [
-            "PHAN_QUYET_CUA_TOA_SO_THAM.Tang_nang",
-            "PHAN_QUYET_CUA_TOA_SO_THAM.Giam_nhe",
-        ]),
+        default=",".join(DEFAULT_REASON_ACT_TRAIN_FIELDS + DEFAULT_SENTENCING_CALIBRATION_FIELDS),
     )
     parser.add_argument("--broad-top-k-case", type=int, default=64)
     parser.add_argument("--top-k-case", type=int, default=5)
@@ -304,6 +315,7 @@ def main() -> None:
     print(f"Input fields={input_fields}")
     print(f"Query fields={query_fields}")
     print(f"Train embedding fields={train_embedding_fields}")
+    print(f"Synthetic_summary format={SYNTHETIC_SUMMARY_FORMAT_NOTE}")
     print(f"Mandatory supporting articles={list(MANDATORY_SUPPORTING_DIEU)}")
     print(f"Train label index size={len(train_articles_index)} (skipped={len(train_skipped)})")
 
@@ -333,6 +345,7 @@ def main() -> None:
         "input_fields": input_fields,
         "query_fields": query_fields,
         "train_embedding_fields": train_embedding_fields,
+        "synthetic_summary_format": SYNTHETIC_SUMMARY_FORMAT_NOTE,
         "broad_top_k_case": args.broad_top_k_case,
         "top_k_case": args.top_k_case,
         "mandatory_supporting_articles": list(MANDATORY_SUPPORTING_DIEU),
@@ -341,7 +354,6 @@ def main() -> None:
         "n_train_label_skipped": len(train_skipped),
     }
 
-    results_out.parent.mkdir(parents=True, exist_ok=True)
     for path in files:
         if path.name in completed_files:
             print(f"Already processed, skipping: {path.name}")
@@ -366,12 +378,10 @@ def main() -> None:
         )
         per_doc.append(result)
         print(f"{result['status']}: {path.name} ({result.get('reason', '')})")
-        with open(results_out, "w", encoding="utf-8") as fh:
-            json.dump({"config": config, "summary": None, "per_doc": per_doc}, fh, ensure_ascii=False, indent=2)
+        save_eval_results(results_out, config=config, summary=None, per_doc=per_doc)
 
     summary = _aggregate(per_doc)
-    with open(results_out, "w", encoding="utf-8") as fh:
-        json.dump({"config": config, "summary": summary, "per_doc": per_doc}, fh, ensure_ascii=False, indent=2)
+    save_eval_results(results_out, config=config, summary=summary, per_doc=per_doc)
 
     print("DONE")
     print(f"Saved: {results_out}")

@@ -10,18 +10,17 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from rag.config import LEGAL_SOURCE_FIELD, VERDICT_FIELD
+from rag.config import VERDICT_FIELD
 from rag.core.law_retriever import LawClauseRetriever
-from rag.core.verdict_labels import is_blhs_legal_source
-from rag.evaluation.retrieval_eval import load_articles_index
+from rag.evaluation.eval_utils import load_articles_index
 from rag.generation.schemas import (
     CandidateOffence,
-    GenerationOutput,
     ReasonActAnalysisOutput,
     ReasonActFinalOutput,
     ReasonActLegalAnalysis,
     ReasonActTrace,
     RetrievedLawArticle,
+    SentencingCalibrationCase,
     SimilarCaseSummary,
     SupportingArticleAssessment,
     build_output_schema_instruction,
@@ -34,7 +33,15 @@ from rag.llm.providers import (
 from rag.runtime.retrieval import RetrievalRuntime
 
 MANDATORY_SUPPORTING_DIEU = ("38", "50", "51", "52", "53", "54", "55", "56", "57", "58", "65", "47")
-DEFAULT_REASON_ACT_TRAIN_FIELDS = ["Summary", "NOI_DUNG_VU_AN", "NHAN_DINH_CUA_TOA_AN", "Tang_nang", "Giam_nhe"]
+DEFAULT_REASON_ACT_TRAIN_FIELDS = ["NHAN_DINH_CUA_TOA_AN.[2]"]
+MITIGATION_EMBED_FIELD = "PHAN_QUYET_CUA_TOA_SO_THAM.Giam_nhe"
+AGGRAVATION_EMBED_FIELD = "PHAN_QUYET_CUA_TOA_SO_THAM.Tang_nang"
+DEFAULT_SENTENCING_CALIBRATION_FIELDS = [AGGRAVATION_EMBED_FIELD, MITIGATION_EMBED_FIELD]
+SYNTHETIC_SUMMARY_FORMAT_NOTE = (
+    "case_fields.Synthetic_summary may be a JSON array encoded as a string. "
+    "Each array item is a separate first-person story for one defendant. "
+    "Map each story to the defendant named inside that story and keep per-defendant facts separate."
+)
 
 
 def _normalize_space(text: Any) -> str:
@@ -49,6 +56,23 @@ def _strip_accents(text: str) -> str:
 def _tokenize(text: str) -> set[str]:
     folded = _strip_accents(text).lower()
     return {tok for tok in re.findall(r"[a-z0-9]+", folded) if len(tok) >= 3}
+
+
+def _name_key(text: Any) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", _strip_accents(str(text or "")).lower()))
+
+
+def _unique_text_items(items: list[str] | None) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items or []:
+        text = _normalize_space(item)
+        key = _strip_accents(text).lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
 
 
 def _resolve_field_value(data: dict[str, Any], field: str) -> Any:
@@ -279,6 +303,42 @@ def _verdict_items(data: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
 
 
+def _prosecution_items(data: dict[str, Any]) -> list[dict[str, Any]]:
+    items = data.get("De_Nghi_Cua_Vien_Kiem_Sat")
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def _prosecution_item_for_defendant(data: dict[str, Any], defendant_name: str | None) -> dict[str, Any] | None:
+    items = _prosecution_items(data)
+    if not items:
+        return None
+    if defendant_name:
+        defendant_key = _name_key(defendant_name)
+        for item in items:
+            if _name_key(item.get("Bi_Cao")) == defendant_key:
+                return item
+    return items[0] if len(items) == 1 else None
+
+
+def _verdict_item_from_metadata(data: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any] | None:
+    verdicts = _verdict_items(data)
+    record_index = metadata.get("record_index")
+    if isinstance(record_index, int) and 0 <= record_index < len(verdicts):
+        return verdicts[record_index]
+    if isinstance(record_index, str) and record_index.isdigit():
+        idx = int(record_index)
+        if 0 <= idx < len(verdicts):
+            return verdicts[idx]
+
+    defendant_name = metadata.get("defendant_name")
+    if defendant_name:
+        defendant_key = _name_key(defendant_name)
+        for item in verdicts:
+            if _name_key(item.get("Bi_Cao")) == defendant_key:
+                return item
+    return verdicts[0] if len(verdicts) == 1 else None
+
+
 def _case_labels_contain_dieu(labels: dict[str, set[str]] | None, dieu: str | None) -> bool:
     return bool(dieu and labels and str(dieu) in labels.get("dieu_only", set()))
 
@@ -317,6 +377,8 @@ def _case_profile_text(data: dict[str, Any]) -> str:
         value = data.get(field)
         if isinstance(value, str):
             parts.append(value[:2500])
+        elif value:
+            parts.append(json.dumps(value, ensure_ascii=False)[:2500])
     verdict_profiles: list[str] = []
     for item in _verdict_items(data):
         for field in ("Tang_nang", "Giam_nhe", "Trach_Nhiem_Dan_Su", "Pham_Toi"):
@@ -405,6 +467,93 @@ def retrieve_similar_cases(
     return [_summarize_similar_case(train_docs[rid], rid, selected_dieu) for _, rid in ranked[:top_k]]
 
 
+def retrieve_sentencing_calibration_cases(
+    *,
+    runtime: RetrievalRuntime,
+    train_dir: Path,
+    train_articles_index: dict[str, dict[str, set[str]]],
+    mitigation_factors: list[str],
+    aggravation_factors: list[str],
+    selected_dieu: str | None,
+    exclude_doc_id: str | None,
+    top_k_per_factor: int = 3,
+    broad_top_k: int = 64,
+) -> list[SentencingCalibrationCase]:
+    if top_k_per_factor <= 0 or not selected_dieu:
+        return []
+
+    train_docs = _load_train_doc_map(train_dir)
+    queries = [
+        ("mitigation", MITIGATION_EMBED_FIELD, factor)
+        for factor in _unique_text_items(mitigation_factors)
+    ] + [
+        ("aggravation", AGGRAVATION_EMBED_FIELD, factor)
+        for factor in _unique_text_items(aggravation_factors)
+    ]
+    calibration_cases: list[SentencingCalibrationCase] = []
+
+    for factor_type, target_field, factor in queries:
+        n_fetch = max(broad_top_k, top_k_per_factor * 16)
+        cap = max(n_fetch, top_k_per_factor * 80)
+        factor_cases: list[SentencingCalibrationCase] = []
+        seen: set[tuple[str, str | None, str | None]] = set()
+
+        while True:
+            results = runtime.query_train(
+                query_text=factor,
+                top_k=n_fetch,
+                exclude_doc_id=exclude_doc_id,
+                include=["metadatas", "distances"],
+            )
+            rows = zip(results.get("metadatas", [[]])[0], results.get("distances", [[]])[0])
+            for meta, distance in rows:
+                if not isinstance(meta, dict):
+                    continue
+                if meta.get("field") != target_field:
+                    continue
+                rid = str(meta.get("doc_id") or "").strip()
+                if not rid:
+                    continue
+                if not _case_labels_contain_dieu(train_articles_index.get(rid), selected_dieu):
+                    continue
+                data = train_docs.get(rid)
+                if not data:
+                    continue
+                verdict = _verdict_item_from_metadata(data, meta)
+                if not verdict:
+                    continue
+                defendant_name = _normalize_space(verdict.get("Bi_Cao")) or None
+                seen_key = (rid, defendant_name, target_field)
+                if seen_key in seen:
+                    continue
+                seen.add(seen_key)
+                score = 1.0 - float(distance or 0.0)
+                factor_cases.append(
+                    SentencingCalibrationCase(
+                        factor_type=factor_type,
+                        query_factor=factor,
+                        doc_id=rid,
+                        similarity_score=score,
+                        matched_field=target_field,
+                        defendant_name=defendant_name,
+                        prosecution_proposal=_prosecution_item_for_defendant(data, defendant_name),
+                        court_aggravation=_normalize_space(verdict.get("Tang_nang")) or None,
+                        court_mitigation=_normalize_space(verdict.get("Giam_nhe")) or None,
+                        court_sentence=_normalize_space(verdict.get("Phat_Tu")) or None,
+                    )
+                )
+                if len(factor_cases) >= top_k_per_factor:
+                    break
+
+            if len(factor_cases) >= top_k_per_factor or n_fetch >= cap:
+                break
+            n_fetch = min(n_fetch * 2, cap)
+
+        calibration_cases.extend(factor_cases[:top_k_per_factor])
+
+    return calibration_cases
+
+
 def _call_llm(
     *,
     provider: LLMProvider | str,
@@ -436,8 +585,20 @@ def _candidate_prompt(doc_id: str, case_payload: dict[str, str]) -> tuple[str, s
     payload = {
         "doc_id": doc_id,
         "case_fields": case_payload,
+        "input_format": {
+            "Synthetic_summary": SYNTHETIC_SUMMARY_FORMAT_NOTE,
+            "per_defendant_requirement": (
+                "Extract defendant names and facts from each separate story. "
+                "Do not merge one defendant's mitigating/aggravating facts, prior convictions, conduct, or sentence-relevant details into another defendant."
+            ),
+        },
         "task": [
             "Extract structured facts. Distinguish stated facts, conservative inferred facts, and missing facts.",
+            "When Synthetic_summary is a list, extract facts per story and preserve which facts belong to which defendant.",
+            "List mitigating factors as atomic statements in mitigation_factors; use one standalone fact per string.",
+            "List aggravating factors as atomic statements in aggravation_factors; use one standalone fact per string.",
+            "For multi-defendant cases, include the defendant name in each mitigation/aggravation factor string.",
+            "Only include mitigation/aggravation factors supported by stated facts; do not invent factors.",
             "Generate 2 to 5 plausible BLHS offence candidates.",
             "Do not assume unknown facts are true.",
             "Preserve defendant names exactly as provided.",
@@ -484,20 +645,36 @@ def _final_prompt(
     offence_articles: list[RetrievedLawArticle],
     supporting_articles: list[RetrievedLawArticle],
     similar_cases: list[SimilarCaseSummary],
+    sentencing_calibration_cases: list[SentencingCalibrationCase],
 ) -> tuple[str, str]:
     system = "You are a Vietnamese criminal judgment prediction assistant. Return only valid JSON."
     payload = {
         "doc_id": doc_id,
         "case_fields": case_payload,
+        "input_format": {
+            "Synthetic_summary": SYNTHETIC_SUMMARY_FORMAT_NOTE,
+            "per_defendant_requirement": (
+                "Generate one defendants entry for each defendant story and use only that defendant's own story plus shared case facts for individual sentencing factors."
+            ),
+        },
         "legal_analysis": legal_analysis.model_dump(),
         "retrieved_offence_articles": [item.model_dump() for item in offence_articles if item.found],
         "retrieved_supporting_articles": [item.model_dump() for item in supporting_articles],
         "similar_cases_for_analogy_only": [item.model_dump() for item in similar_cases],
+        "sentencing_calibration_cases": [item.model_dump() for item in sentencing_calibration_cases],
         "rules": [
             "Produce final prediction in GenerationOutput.",
+            "When Synthetic_summary is a list, generate one matching defendants item per story and preserve the defendant name from that story.",
             "Include only actually applicable clauses in Applied_Law_Clauses.",
             "Do not include checked-but-not-applicable or fact-dependent articles in Applied_Law_Clauses.",
             "Use similar cases only for analogy and sentencing calibration, never to override statutory law.",
+            (
+                "For sentencing_calibration_cases, read De_Nghi_Cua_Vien_Kiem_Sat.Phat_Tu as the prosecution's requested "
+                "prison range, and PHAN_QUYET_CUA_TOA_SO_THAM.Tang_nang, Giam_nhe, and Phat_Tu as the court's applied "
+                "aggravating factors, mitigating factors, and final prison term. Use these past cases only to calibrate "
+                "the current prison term by comparing how similar the current mitigation/aggravation factors are to the "
+                "retrieved cases."
+            ),
             "Predict concrete Phat_Tu, additional fine, civil/property consequences, and Xu_Ly_Vat_Chung when supported.",
             "For mitigation advice, only mention lawful cooperation, restitution, documentation, and procedural steps.",
         ],
@@ -585,6 +762,17 @@ def run_reasoning_act(
         broad_top_k=broad_top_k_case,
         top_k=top_k_case,
     )
+    sentencing_calibration_cases = retrieve_sentencing_calibration_cases(
+        runtime=case_runtime,
+        train_dir=train_dir,
+        train_articles_index=train_articles_index,
+        mitigation_factors=facts_and_candidates.mitigation_factors,
+        aggravation_factors=facts_and_candidates.aggravation_factors,
+        selected_dieu=selected_dieu,
+        exclude_doc_id=doc_id,
+        top_k_per_factor=3,
+        broad_top_k=broad_top_k_case,
+    )
 
     system, user = _final_prompt(
         doc_id=doc_id,
@@ -593,6 +781,7 @@ def run_reasoning_act(
         offence_articles=offence_articles,
         supporting_articles=supporting_articles,
         similar_cases=similar_cases,
+        sentencing_calibration_cases=sentencing_calibration_cases,
     )
     final_output, call_usage = _call_llm(
         provider=provider,
@@ -607,6 +796,8 @@ def run_reasoning_act(
     trace = ReasonActTrace(
         facts=facts_and_candidates.facts,
         candidates=facts_and_candidates.candidates,
+        mitigation_factors=facts_and_candidates.mitigation_factors,
+        aggravation_factors=facts_and_candidates.aggravation_factors,
         selected_offence=final_output.legal_analysis.selected_offence,
         rejected_candidates=final_output.legal_analysis.rejected_candidates,
         retrieved_offence_articles=offence_articles,
@@ -617,6 +808,7 @@ def run_reasoning_act(
             case_text=case_text,
         ),
         similar_cases=similar_cases,
+        sentencing_calibration_cases=sentencing_calibration_cases,
         sentencing_bracket=final_output.legal_analysis.sentencing_bracket,
         confidence=final_output.legal_analysis.confidence,
         missing_facts=final_output.legal_analysis.missing_facts,

@@ -39,21 +39,26 @@ from rag.config import (
 from rag.core.law_retriever import LawClauseRetriever
 from rag.core.sentencing import extract_imprisonment_months
 from rag.core.verdict_labels import is_blhs_legal_source, split_multi_value
-from rag.evaluation.retrieval_eval import load_articles_index
+from rag.evaluation.eval_utils import load_articles_index, save_eval_results
 from rag.llm.providers import (
     LLMProvider,
     default_model_for_provider,
     generate_structured_output,
     generate_structured_output_with_fallback,
 )
-from rag.core.embeddings import run_pipeline
+from rag.core.embeddings import load_chroma, run_pipeline
+from rag.generation.reasoning_act import DEFAULT_REASON_ACT_TRAIN_FIELDS, MANDATORY_SUPPORTING_DIEU
 from rag.generation.schemas import GenerationOutput, build_output_schema_instruction
 from rag.runtime.retrieval import RetrievalRuntime, RetrievalRuntimeConfig
 
 load_dotenv()
 
-# Always treat these core BLHS Dieu as present in retrieved law-clause candidates.
-ALWAYS_INCLUDE_DIEU = ("51", "52", "47", "38", "55", "56")
+# Keep this in sync with reasoning_act_eval's mandatory supporting articles.
+ALWAYS_INCLUDE_DIEU = MANDATORY_SUPPORTING_DIEU
+DEFAULT_TRAIN_EMBEDDING_FIELDS = DEFAULT_REASON_ACT_TRAIN_FIELDS + [
+    "PHAN_QUYET_CUA_TOA_SO_THAM.Tang_nang",
+    "PHAN_QUYET_CUA_TOA_SO_THAM.Giam_nhe",
+]
 
 
 def _normalize_space(text: str) -> str:
@@ -347,7 +352,7 @@ def _build_past_cases_context(
     train_dir: Path,
     max_cases: int = 2
 ) -> list[dict[str, Any]]:
-    """Loads the summary and verdict of top retrieved cases to use as reasoning examples."""
+    """Load court reasoning and verdict of top retrieved cases for reasoning examples."""
     past_cases = []
     for doc_id in case_doc_ids[:max_cases]:
         file_path = train_dir / f"{doc_id}.json"
@@ -360,7 +365,6 @@ def _build_past_cases_context(
                 
             past_cases.append({
                 "doc_id": doc_id,
-                "Case_Summary": data.get("Summary") or data.get("Synthetic_summary", ""),
                 "Court_Reasoning": data.get("NHAN_DINH_CUA_TOA_AN", {}),
                 "Verdict": data.get("PHAN_QUYET_CUA_TOA_SO_THAM", [])
             })
@@ -765,7 +769,7 @@ def main() -> None:
     parser.add_argument(
         "--top-k-case",
         type=int,
-        default=10,
+        default=5,
         help="Top-k similar past train cases used to build the law-clause union",
     )
     parser.add_argument("--law-id", default="BLHS")
@@ -783,7 +787,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--train-embedding-fields",
-        default="Summary",
+        default=",".join(DEFAULT_TRAIN_EMBEDDING_FIELDS),
         help="Comma-separated fields to embed for train case retrieval index",
     )
     parser.add_argument("--first-n", type=int, default=None, help="Process only first N files")
@@ -848,6 +852,16 @@ def main() -> None:
         batch_size=args.batch_size,
         collection_name=args.collection_name,
     )
+    try:
+        load_chroma(str(case_db_dir), collection_name=args.collection_name, create=False)
+    except Exception as exc:
+        fields = ", ".join(train_embedding_fields)
+        raise RuntimeError(
+            "Train case retrieval collection was not created. "
+            f"No chunks may have been produced from --train-embedding-fields={fields!r}. "
+            "Choose fields that exist in chunk/train, for example "
+            f"{','.join(DEFAULT_TRAIN_EMBEDDING_FIELDS)!r}."
+        ) from exc
 
     train_articles_index, train_skipped = load_articles_index(train_dir)
 
@@ -879,8 +893,45 @@ def main() -> None:
     print(f"Law retriever dieu index size={len(getattr(law_retriever, '_dieu_index', {}))}")
     print(f"Train label index size={len(train_articles_index)} (skipped={len(train_skipped)})")
 
+    config = {
+        "train_dir": str(train_dir),
+        "test_dir": str(test_dir),
+        "law_json": str(law_json),
+        "case_db_dir": str(case_db_dir),
+        "law_db_dir": str(law_db_dir),
+        "provider": provider.value,
+        "model": model_name,
+        "provider_fallback": use_provider_fallback,
+        "embedding_model": args.embed_model,
+        "device": args.device,
+        "collection_name": args.collection_name,
+        "top_k_law": args.top_k_law,
+        "top_k_case": args.top_k_case,
+        "input_fields": input_fields,
+        "query_fields": query_fields,
+        "train_embedding_fields": train_embedding_fields,
+        "always_include_dieu": list(ALWAYS_INCLUDE_DIEU),
+        "only_blhs": args.only_blhs,
+        "n_train_label_index": len(train_articles_index),
+        "n_train_label_skipped": len(train_skipped),
+    }
+
     per_doc: list[dict[str, Any]] = []
+    completed_files: set[str] = set()
+    if results_out.exists():
+        try:
+            with open(results_out, encoding="utf-8") as fh:
+                existing_data = json.load(fh)
+            per_doc = existing_data.get("per_doc", [])
+            completed_files = {doc.get("source_file") for doc in per_doc if doc.get("source_file")}
+            print(f"Resuming from {results_out}: {len(completed_files)} files already processed.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not load existing results from {results_out}: {exc}")
+
     for path in files:
+        if path.name in completed_files:
+            print(f"Already processed, skipping: {path.name}")
+            continue
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         result = _evaluate_single_doc(
@@ -900,38 +951,10 @@ def main() -> None:
         )
         per_doc.append(result)
         print(f"{result['status']}: {path.name} ({result.get('reason', '')})")
+        save_eval_results(results_out, config=config, summary=None, per_doc=per_doc)
 
     summary = _aggregate(per_doc)
-    output = {
-        "config": {
-            "train_dir": str(train_dir),
-            "test_dir": str(test_dir),
-            "law_json": str(law_json),
-            "case_db_dir": str(case_db_dir),
-            "law_db_dir": str(law_db_dir),
-            "provider": provider.value,
-            "model": model_name,
-            "provider_fallback": use_provider_fallback,
-            "embedding_model": args.embed_model,
-            "device": args.device,
-            "collection_name": args.collection_name,
-            "top_k_law": args.top_k_law,
-            "top_k_case": args.top_k_case,
-            "input_fields": input_fields,
-            "query_fields": query_fields,
-            "train_embedding_fields": train_embedding_fields,
-            "always_include_dieu": list(ALWAYS_INCLUDE_DIEU),
-            "only_blhs": args.only_blhs,
-            "n_train_label_index": len(train_articles_index),
-            "n_train_label_skipped": len(train_skipped),
-        },
-        "summary": summary,
-        "per_doc": per_doc,
-    }
-
-    results_out.parent.mkdir(parents=True, exist_ok=True)
-    with open(results_out, "w", encoding="utf-8") as fh:
-        json.dump(output, fh, ensure_ascii=False, indent=2)
+    save_eval_results(results_out, config=config, summary=summary, per_doc=per_doc)
 
     print("DONE")
     print(f"Saved: {results_out}")

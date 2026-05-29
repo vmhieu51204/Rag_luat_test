@@ -49,22 +49,23 @@ class PredictedDefendant(BaseModel):
         description="Civil liability decision for the defendant when applicable.",
     )
 
+
 class PredictedDefendantRange(BaseModel):
     Bi_Cao: str = Field(description="Defendant name exactly matching the case context.")
     Phan_Tich_Phap_Ly: str | None = Field(
         default=None,
         description=(
-            "Concise legal reasoning based only on provided case facts. Identify mitigating and aggravating factors based on the provided article 51 and article 51."
+            "Concise legal reasoning based only on provided case facts. Identify mitigating and aggravating factors based on the provided articles 51 and 52."
         ),
     )
     Toi_Danh: str | None = Field(default=None, description="Offense/crime name for the defendant.")
     Applied_Law_Clauses: list[PredictedLawClause] = Field(
         default_factory=list,
-        description="List of applicable legal clauses supporting the verdict for this defendant.",
+        description="List of applicable legal clauses supporting the verdict range for this defendant.",
     )
     Phat_Tu_Range: str | None = Field(
         default=None,
-        description="Predicted imprisonment range based on the law clauses and prosecutor's proposal (e.g. 'từ 02 năm đến 03 năm tù'). Must be a range.",
+        description="Predicted imprisonment range based on the law clauses and case facts, e.g. 'từ 02 năm đến 03 năm tù'. Must be a range.",
     )
     Phat_Tien: str | None = Field(
         default=None,
@@ -75,12 +76,6 @@ class PredictedDefendantRange(BaseModel):
         description="Civil liability decision for the defendant when applicable.",
     )
 
-class GenerationRangeOutput(BaseModel):
-    defendants: list[PredictedDefendantRange] = Field(description="Per-defendant structured predictions.")
-    Xu_Ly_Vat_Chung: str | None = Field(
-        default=None,
-        description="Decision on handling/seizure/disposal of physical evidence related to the case based on the provided article 47",
-    )
 
 class GenerationOutput(BaseModel):
     defendants: list[PredictedDefendant] = Field(description="Per-defendant structured predictions.")
@@ -88,6 +83,15 @@ class GenerationOutput(BaseModel):
         default=None,
         description="Decision on handling/seizure/disposal of physical evidence related to the case based on the provided article 47",
     )
+
+
+class GenerationRangeOutput(BaseModel):
+    defendants: list[PredictedDefendantRange] = Field(description="Per-defendant structured range predictions.")
+    Xu_Ly_Vat_Chung: str | None = Field(
+        default=None,
+        description="Decision on handling/seizure/disposal of physical evidence related to the case based on the provided article 47",
+    )
+
 
 class ExtractedFacts(BaseModel):
     defendants: list[str] = Field(default_factory=list, description="Defendant names exactly as provided.")
@@ -104,11 +108,10 @@ class ExtractedFacts(BaseModel):
     inferred_facts: list[str] = Field(default_factory=list, description="Facts inferred from stated facts; keep conservative.")
     missing_facts: list[str] = Field(default_factory=list, description="Missing facts that could change the legal result.")
 
-
 class CandidateOffence(BaseModel):
     Dieu: str | None = Field(default=None, description="Candidate BLHS article number.")
-    Khoan: str | None = Field(default=None, description="Likely clause number if known.")
-    Diem: str | None = Field(default=None, description="Likely point letter if known.")
+    Khoan: str | None = Field(default=None, description="Likely clause number if known, otherwise keep null if unsure of exact clause.")
+    Diem: str | None = Field(default=None, description="Likely point letter if known, otherwise keep null if unsure of exact point.")
     offence_name: str | None = Field(default=None, description="Candidate offence name.")
     search_query: str | None = Field(default=None, description="Short search/retrieval query for this candidate.")
     supporting_facts: str | None = Field(default=None, description="Facts supporting this candidate.")
@@ -117,14 +120,12 @@ class CandidateOffence(BaseModel):
         description="Reason this candidate is rejected or downgraded; null for the selected candidate.",
     )
 
-
 class RetrievedLawArticle(BaseModel):
     signature: str = Field(description="Requested law signature, e.g. 174-4-a or 51.")
     found: bool = Field(description="Whether exact retrieval found text in raw_law.json.")
     level: str | None = Field(default=None, description="Retrieved level: dieu, khoan, diem, or null.")
     text: str | None = Field(default=None, description="Retrieved statutory text.")
     missing_reason: str | None = Field(default=None, description="Retriever reason when not found.")
-
 
 class SupportingArticleAssessment(BaseModel):
     article: str = Field(description="BLHS article number checked.")
@@ -134,7 +135,6 @@ class SupportingArticleAssessment(BaseModel):
     factual_trigger: str | None = Field(default=None, description="Facts triggering this classification.")
     explanation: str | None = Field(default=None, description="Concise legal explanation.")
 
-
 class SimilarCaseSummary(BaseModel):
     doc_id: str = Field(description="Similar train-case document id.")
     matched_offence_article: str | None = Field(default=None, description="Selected offence article matched in this case.")
@@ -143,11 +143,43 @@ class SimilarCaseSummary(BaseModel):
     sentence: str | None = Field(default=None, description="Ground-truth sentence in the similar case.")
     notable_reasoning: str | None = Field(default=None, description="Notable reasoning or property/civil handling details.")
 
+class SentencingCalibrationCase(BaseModel):
+    factor_type: Literal["mitigation", "aggravation"] = Field(
+        description="Whether the retrieved past case matched a mitigating or aggravating factor."
+    )
+    query_factor: str = Field(description="Atomic current-case factor used as the retrieval query.")
+    doc_id: str = Field(description="Retrieved train-case document id.")
+    similarity_score: float | None = Field(default=None, description="Vector similarity score, if available.")
+    matched_field: str | None = Field(default=None, description="Embedded verdict field matched by vector retrieval.")
+    defendant_name: str | None = Field(default=None, description="Defendant in the retrieved verdict item, if available.")
+    prosecution_proposal: Any | None = Field(
+        default=None,
+        description="Matching De_Nghi_Cua_Vien_Kiem_Sat item for this defendant, including Phat_Tu range if available.",
+    )
+    court_aggravation: str | None = Field(
+        default=None,
+        description="PHAN_QUYET_CUA_TOA_SO_THAM.Tang_nang for the matched defendant.",
+    )
+    court_mitigation: str | None = Field(
+        default=None,
+        description="PHAN_QUYET_CUA_TOA_SO_THAM.Giam_nhe for the matched defendant.",
+    )
+    court_sentence: str | None = Field(
+        default=None,
+        description="PHAN_QUYET_CUA_TOA_SO_THAM.Phat_Tu for the matched defendant.",
+    )
 
 class ReasonActAnalysisOutput(BaseModel):
     facts: ExtractedFacts = Field(description="Structured facts extracted from the input.")
     candidates: list[CandidateOffence] = Field(description="Two to five candidate BLHS offences.")
-
+    mitigation_factors: list[str] = Field(
+        default_factory=list,
+        description="Atomic mitigating-factor statements extracted from the case facts; one fact per string and include the defendant name when relevant.",
+    )
+    aggravation_factors: list[str] = Field(
+        default_factory=list,
+        description="Atomic aggravating-factor statements extracted from the case facts; one fact per string and include the defendant name when relevant.",
+    )
 
 class ReasonActLegalAnalysis(BaseModel):
     selected_offence: CandidateOffence = Field(description="Likely offence and sentencing bracket selected from retrieved law.")
@@ -169,12 +201,15 @@ class ReasonActFinalOutput(BaseModel):
 class ReasonActTrace(BaseModel):
     facts: ExtractedFacts | None = Field(default=None, description="Structured facts from step 1.")
     candidates: list[CandidateOffence] = Field(default_factory=list, description="Candidate offences from step 2.")
+    mitigation_factors: list[str] = Field(default_factory=list)
+    aggravation_factors: list[str] = Field(default_factory=list)
     selected_offence: CandidateOffence | None = Field(default=None, description="Selected offence from statutory matching.")
     rejected_candidates: list[CandidateOffence] = Field(default_factory=list, description="Rejected/downgraded candidates.")
     retrieved_offence_articles: list[RetrievedLawArticle] = Field(default_factory=list)
     retrieved_supporting_articles: list[RetrievedLawArticle] = Field(default_factory=list)
     supporting_article_assessments: list[SupportingArticleAssessment] = Field(default_factory=list)
     similar_cases: list[SimilarCaseSummary] = Field(default_factory=list)
+    sentencing_calibration_cases: list[SentencingCalibrationCase] = Field(default_factory=list)
     sentencing_bracket: str | None = None
     confidence: str | None = None
     missing_facts: list[str] = Field(default_factory=list)

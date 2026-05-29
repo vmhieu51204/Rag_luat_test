@@ -8,6 +8,7 @@ from pathlib import Path
 from rag.core.law_retriever import LawClauseRetriever
 from rag.generation.reasoning_act import (
     classify_supporting_article_by_facts,
+    retrieve_sentencing_calibration_cases,
     retrieve_law_articles,
     retrieve_similar_cases,
 )
@@ -23,6 +24,39 @@ class FakeRuntime:
                 {"doc_id": "case-c"},
             ]],
             "distances": [[0.10, 0.20, 0.05, 0.30]],
+        }
+
+
+class FakeCalibrationRuntime:
+    def query_train(self, *, query_text, top_k, exclude_doc_id=None, include=None):
+        if "thành khẩn" in query_text.lower():
+            return {
+                "metadatas": [[
+                    {
+                        "doc_id": "case-a",
+                        "field": "PHAN_QUYET_CUA_TOA_SO_THAM.Giam_nhe",
+                        "record_index": 0,
+                        "defendant_name": "A",
+                    },
+                    {
+                        "doc_id": "case-b",
+                        "field": "PHAN_QUYET_CUA_TOA_SO_THAM.Giam_nhe",
+                        "record_index": 0,
+                        "defendant_name": "B",
+                    },
+                ]],
+                "distances": [[0.10, 0.20]],
+            }
+        return {
+            "metadatas": [[
+                {
+                    "doc_id": "case-c",
+                    "field": "PHAN_QUYET_CUA_TOA_SO_THAM.Tang_nang",
+                    "record_index": 0,
+                    "defendant_name": "C",
+                }
+            ]],
+            "distances": [[0.05]],
         }
 
 
@@ -129,6 +163,73 @@ class ReasoningActTests(unittest.TestCase):
         self.assertEqual(len(similar), 2)
         self.assertEqual({item.doc_id for item in similar}, {"case-a", "case-c"})
         self.assertTrue(all(item.sentence for item in similar))
+
+    def test_sentencing_calibration_retrieval_uses_verdict_factor_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            train_dir = Path(tmp)
+            docs = {
+                "case-a": {
+                    "Ma_Ban_An": "case-a",
+                    "De_Nghi_Cua_Vien_Kiem_Sat": [{"Bi_Cao": "A", "Phat_Tu": "từ 02 năm đến 03 năm tù"}],
+                    "PHAN_QUYET_CUA_TOA_SO_THAM": [
+                        {
+                            "Bi_Cao": "A",
+                            "Phat_Tu": "02 năm tù",
+                            "Giam_nhe": "Thành khẩn khai báo",
+                            "Tang_nang": None,
+                        }
+                    ],
+                },
+                "case-b": {
+                    "Ma_Ban_An": "case-b",
+                    "De_Nghi_Cua_Vien_Kiem_Sat": [{"Bi_Cao": "B", "Phat_Tu": "từ 01 năm đến 02 năm tù"}],
+                    "PHAN_QUYET_CUA_TOA_SO_THAM": [
+                        {
+                            "Bi_Cao": "B",
+                            "Phat_Tu": "01 năm tù",
+                            "Giam_nhe": "Thành khẩn khai báo, ăn năn hối cải",
+                        }
+                    ],
+                },
+                "case-c": {
+                    "Ma_Ban_An": "case-c",
+                    "De_Nghi_Cua_Vien_Kiem_Sat": [{"Bi_Cao": "C", "Phat_Tu": "từ 03 năm đến 04 năm tù"}],
+                    "PHAN_QUYET_CUA_TOA_SO_THAM": [
+                        {
+                            "Bi_Cao": "C",
+                            "Phat_Tu": "03 năm tù",
+                            "Tang_nang": "Phạm tội nhiều lần",
+                        }
+                    ],
+                },
+            }
+            for doc_id, data in docs.items():
+                (train_dir / f"{doc_id}.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+            cases = retrieve_sentencing_calibration_cases(
+                runtime=FakeCalibrationRuntime(),
+                train_dir=train_dir,
+                train_articles_index={
+                    "case-a": {"dieu_only": {"174"}, "full_signature": {"174"}},
+                    "case-b": {"dieu_only": {"173"}, "full_signature": {"173"}},
+                    "case-c": {"dieu_only": {"174"}, "full_signature": {"174"}},
+                },
+                mitigation_factors=["Bị cáo thành khẩn khai báo"],
+                aggravation_factors=["Bị cáo phạm tội nhiều lần"],
+                selected_dieu="174",
+                exclude_doc_id="test",
+                top_k_per_factor=1,
+                broad_top_k=4,
+            )
+
+        self.assertEqual(len(cases), 2)
+        mitigation = next(item for item in cases if item.factor_type == "mitigation")
+        aggravation = next(item for item in cases if item.factor_type == "aggravation")
+        self.assertEqual(mitigation.doc_id, "case-a")
+        self.assertEqual(mitigation.prosecution_proposal["Phat_Tu"], "từ 02 năm đến 03 năm tù")
+        self.assertEqual(mitigation.court_sentence, "02 năm tù")
+        self.assertEqual(aggravation.doc_id, "case-c")
+        self.assertEqual(aggravation.court_aggravation, "Phạm tội nhiều lần")
 
 
 if __name__ == "__main__":
