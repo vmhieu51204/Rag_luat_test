@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import unicodedata
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -44,8 +47,8 @@ from rag.llm.providers import (
     LLMProvider,
     default_model_for_provider,
     generate_structured_output,
-    generate_structured_output_with_fallback,
 )
+import rag.llm.providers as llm_providers
 from rag.core.embeddings import load_chroma, run_pipeline
 from rag.generation.reasoning_act import DEFAULT_REASON_ACT_TRAIN_FIELDS, MANDATORY_SUPPORTING_DIEU
 from rag.generation.schemas import GenerationOutput, build_output_schema_instruction
@@ -59,6 +62,7 @@ DEFAULT_TRAIN_EMBEDDING_FIELDS = DEFAULT_REASON_ACT_TRAIN_FIELDS + [
     "PHAN_QUYET_CUA_TOA_SO_THAM.Tang_nang",
     "PHAN_QUYET_CUA_TOA_SO_THAM.Giam_nhe",
 ]
+MAX_FINAL_CASES_PER_ISSUE = 5
 
 
 def _normalize_space(text: str) -> str:
@@ -310,6 +314,7 @@ def _retrieve_similar_case_doc_ids(
     exclude_doc_id: str,
     top_k_case: int,
 ) -> list[str]:
+    top_k_case = min(top_k_case, MAX_FINAL_CASES_PER_ISSUE)
     if top_k_case <= 0:
         return []
 
@@ -350,7 +355,7 @@ def _retrieve_similar_case_doc_ids(
 def _build_past_cases_context(
     case_doc_ids: list[str],
     train_dir: Path,
-    max_cases: int = 2
+    max_cases: int = MAX_FINAL_CASES_PER_ISSUE
 ) -> list[dict[str, Any]]:
     """Load court reasoning and verdict of top retrieved cases for reasoning examples."""
     past_cases = []
@@ -424,6 +429,20 @@ def _retrieve_explicit_law_by_dieu(
     return explicit
 
 
+def _compact_explicit_law_clauses(explicit_law_clauses: list[dict[str, str]]) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for item in explicit_law_clauses:
+        text = str(item.get("text") or "")
+        compact.append(
+            {
+                "dieu": item.get("dieu", ""),
+                "signature": item.get("signature", ""),
+                "text_chars": len(text),
+            }
+        )
+    return compact
+
+
 def _build_prompts(
     *,
     doc_id: str,
@@ -481,6 +500,174 @@ def _build_prompts(
     return system_prompt, user_prompt
 
 
+def _get_aistudio_api_keys() -> list[tuple[str, str]]:
+    key_names = ("GOOGLE_API_KEY", "GOOGLE_API_KEY_2", "GOOGLE_API_KEY_3")
+    return [(key_name, api_key) for key_name in key_names if (api_key := os.environ.get(key_name))]
+
+
+def _reset_aistudio_client_cache() -> None:
+    if hasattr(llm_providers, "_aistudio_client"):
+        llm_providers._aistudio_client = None
+
+
+@contextmanager
+def _temporary_google_api_key(api_key: str) -> Iterator[None]:
+    previous = os.environ.get("GOOGLE_API_KEY")
+    os.environ["GOOGLE_API_KEY"] = api_key
+    _reset_aistudio_client_cache()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("GOOGLE_API_KEY", None)
+        else:
+            os.environ["GOOGLE_API_KEY"] = previous
+        _reset_aistudio_client_cache()
+
+
+def _generate_structured_output_aistudio_rotating_keys(
+    *,
+    model_name: str,
+    system_prompt: str,
+    user_prompt: str,
+    output_model: type[Any],
+) -> tuple[Any, dict[str, Any]]:
+    api_keys = _get_aistudio_api_keys()
+    if not api_keys:
+        raise EnvironmentError(
+            "No AI Studio API keys are set. Expected GOOGLE_API_KEY, GOOGLE_API_KEY_2, and/or GOOGLE_API_KEY_3."
+        )
+
+    errors: list[str] = []
+    attempts = [
+        {"provider": LLMProvider.AISTUDIO.value, "model": model_name, "key_name": key_name}
+        for key_name, _ in api_keys
+    ]
+    for key_name, api_key in api_keys:
+        try:
+            with _temporary_google_api_key(api_key):
+                parsed, usage = generate_structured_output(
+                    provider=LLMProvider.AISTUDIO,
+                    model_name=model_name,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    output_model=output_model,
+                )
+            usage = {
+                **usage,
+                "provider": LLMProvider.AISTUDIO.value,
+                "model": model_name,
+                "aistudio_key_name": key_name,
+                "aistudio_key_attempts": attempts,
+                "aistudio_key_errors": errors,
+            }
+            return parsed, usage
+        except Exception as exc:  # noqa: BLE001
+            error_msg = f"{key_name}:{exc}"
+            errors.append(error_msg)
+            print(f"    [Fallback] AI Studio ({key_name}) failed: {exc}")
+
+    raise RuntimeError("All AI Studio API key attempts failed. " + " | ".join(errors))
+
+
+def _openrouter_paid_model(openrouter_free_model: str) -> str:
+    if openrouter_free_model.endswith(":free"):
+        return openrouter_free_model.removesuffix(":free") + ":paid"
+    return openrouter_free_model + ":paid"
+
+
+def _generate_structured_output_with_aistudio_key_rotation(
+    *,
+    provider: LLMProvider,
+    model_name: str,
+    system_prompt: str,
+    user_prompt: str,
+    output_model: type[Any],
+    use_provider_fallback: bool,
+) -> tuple[Any, dict[str, Any]]:
+    if not use_provider_fallback:
+        if provider == LLMProvider.AISTUDIO:
+            return _generate_structured_output_aistudio_rotating_keys(
+                model_name=model_name,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                output_model=output_model,
+            )
+        return generate_structured_output(
+            provider=provider,
+            model_name=model_name,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            output_model=output_model,
+        )
+
+    openrouter_free_model = model_name or default_model_for_provider(LLMProvider.OPENROUTER)
+    openrouter_paid_model = _openrouter_paid_model(openrouter_free_model)
+    ordered_attempts: list[tuple[LLMProvider, str]] = [
+        (LLMProvider.OPENROUTER, openrouter_free_model),
+        (LLMProvider.AISTUDIO, default_model_for_provider(LLMProvider.AISTUDIO)),
+        (LLMProvider.OPENROUTER, openrouter_paid_model),
+    ]
+
+    if provider == LLMProvider.AISTUDIO:
+        ordered_attempts = [
+            (LLMProvider.AISTUDIO, default_model_for_provider(LLMProvider.AISTUDIO)),
+            (LLMProvider.OPENROUTER, openrouter_free_model),
+            (LLMProvider.OPENROUTER, openrouter_paid_model),
+        ]
+    elif provider == LLMProvider.OPENAI:
+        ordered_attempts = [
+            (LLMProvider.OPENAI, model_name or default_model_for_provider(LLMProvider.OPENAI)),
+            (LLMProvider.OPENROUTER, openrouter_free_model),
+            (LLMProvider.AISTUDIO, default_model_for_provider(LLMProvider.AISTUDIO)),
+            (LLMProvider.OPENROUTER, openrouter_paid_model),
+        ]
+
+    attempt_errors: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    last_error: Exception | None = None
+    for attempt_provider, attempt_model in ordered_attempts:
+        key = (attempt_provider.value, attempt_model)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        try:
+            if attempt_provider == LLMProvider.AISTUDIO:
+                parsed, usage = _generate_structured_output_aistudio_rotating_keys(
+                    model_name=attempt_model,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    output_model=output_model,
+                )
+            else:
+                parsed, usage = generate_structured_output(
+                    provider=attempt_provider,
+                    model_name=attempt_model,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    output_model=output_model,
+                )
+            usage = {
+                **usage,
+                "provider": attempt_provider.value,
+                "model": attempt_model,
+                "fallback_attempts": [
+                    {"provider": item_provider.value, "model": item_model}
+                    for item_provider, item_model in ordered_attempts
+                ],
+                "fallback_errors": attempt_errors,
+            }
+            return parsed, usage
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            attempt_errors.append(f"{attempt_provider.value}:{attempt_model}:{exc}")
+
+    if last_error is None:
+        raise RuntimeError("No provider attempt was executed")
+    raise RuntimeError("All provider fallback attempts failed. " + " | ".join(attempt_errors)) from last_error
+
+
 def _evaluate_single_doc(
     *,
     path: Path,
@@ -531,7 +718,7 @@ def _evaluate_single_doc(
     past_cases_context = _build_past_cases_context(
         case_doc_ids=similar_case_doc_ids,
         train_dir=train_dir,
-        max_cases=2
+        max_cases=MAX_FINAL_CASES_PER_ISSUE
     )
 
     forced_clause_set = set(similar_case_context.get("similar_case_law_clause_set", []))
@@ -542,6 +729,7 @@ def _evaluate_single_doc(
         law_signatures=forced_clause_set,
         law_retriever=law_retriever,
     )
+    explicit_law_clause_log = _compact_explicit_law_clauses(explicit_law_clauses)
 
     gt_defendants = _extract_gt_defendants(data, only_blhs=only_blhs)
     gt_union: set[str] = set()
@@ -564,22 +752,14 @@ def _evaluate_single_doc(
     llm_used_model = model_name
 
     try:
-        if use_provider_fallback:
-            pred_output, usage = generate_structured_output_with_fallback(
-                preferred_provider=provider,
-                model_name=model_name,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                output_model=GenerationOutput,
-            )
-        else:
-            pred_output, usage = generate_structured_output(
-                provider=provider,
-                model_name=model_name,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                output_model=GenerationOutput,
-            )
+        pred_output, usage = _generate_structured_output_with_aistudio_key_rotation(
+            provider=provider,
+            model_name=model_name,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            output_model=GenerationOutput,
+            use_provider_fallback=use_provider_fallback,
+        )
     except (ValidationError, json.JSONDecodeError) as exc:
         parse_error = str(exc)
     except Exception as exc:  # noqa: BLE001
@@ -600,7 +780,7 @@ def _evaluate_single_doc(
                 "similar_case_doc_ids": similar_case_context.get("similar_case_doc_ids", []),
                 "similar_case_law_clause_set": similar_case_context.get("similar_case_law_clause_set", []),
             },
-            "explicit_law_clauses": explicit_law_clauses,
+            "explicit_law_clauses": explicit_law_clause_log,
             "defendants": [
                 {
                     "Bi_Cao": item.get("Bi_Cao", ""),
@@ -684,7 +864,7 @@ def _evaluate_single_doc(
             "similar_case_doc_ids": similar_case_context.get("similar_case_doc_ids", []),
             "similar_case_law_clause_set": similar_case_context.get("similar_case_law_clause_set", []),
         },
-        "explicit_law_clauses": explicit_law_clauses,
+        "explicit_law_clauses": explicit_law_clause_log,
         "llm": {
             "requested_provider": provider.value,
             "requested_model": model_name,

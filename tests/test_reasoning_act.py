@@ -8,6 +8,7 @@ from pathlib import Path
 from rag.core.law_retriever import LawClauseRetriever
 from rag.generation.reasoning_act import (
     classify_supporting_article_by_facts,
+    compact_law_signatures,
     retrieve_sentencing_calibration_cases,
     retrieve_law_articles,
     retrieve_similar_cases,
@@ -60,19 +61,52 @@ class FakeCalibrationRuntime:
         }
 
 
+class ManyCalibrationRuntime:
+    def query_train(self, *, query_text, top_k, exclude_doc_id=None, include=None):
+        is_mitigation = "mitigation" in query_text
+        prefix = "mit" if is_mitigation else "agg"
+        field = (
+            "PHAN_QUYET_CUA_TOA_SO_THAM.Giam_nhe"
+            if is_mitigation
+            else "PHAN_QUYET_CUA_TOA_SO_THAM.Tang_nang"
+        )
+        metadatas = [
+            {
+                "doc_id": f"{prefix}-{idx}",
+                "field": field,
+                "record_index": 0,
+                "defendant_name": f"{prefix.upper()}{idx}",
+            }
+            for idx in range(8)
+        ]
+        return {
+            "metadatas": [metadatas],
+            "distances": [[idx / 100 for idx in range(len(metadatas))]],
+        }
+
+
 class ReasoningActTests(unittest.TestCase):
     def test_exact_law_retrieval_records_found_and_missing(self):
         retriever = LawClauseRetriever("raw_law.json")
-        articles = retrieve_law_articles(["201", "201-2", "51-1-s", "52-1-g", "47", "999999"], retriever)
+        articles = retrieve_law_articles(["201-2", "51-1-s", "52-1-g", "47", "999999"], retriever)
         by_signature = {item.signature: item for item in articles}
 
-        for signature in ["201", "201-2", "51-1-s", "52-1-g", "47"]:
+        for signature in ["201-2", "51-1-s", "52-1-g", "47"]:
             self.assertIn(signature, by_signature)
             self.assertTrue(by_signature[signature].found, signature)
             self.assertTrue(by_signature[signature].text)
 
         self.assertFalse(by_signature["999999"].found)
         self.assertEqual(by_signature["999999"].missing_reason, "dieu_not_found")
+
+    def test_law_retrieval_compacts_subclauses_when_full_article_requested(self):
+        self.assertEqual(compact_law_signatures(["201-2", "201", "201-1-a", "51-1-s"]), ["201", "51-1-s"])
+
+        articles = retrieve_law_articles(["201-2", "201", "201-1-a"], LawClauseRetriever("raw_law.json"))
+
+        self.assertEqual([item.signature for item in articles], ["201"])
+        self.assertEqual(articles[0].level, "dieu")
+        self.assertTrue(articles[0].found)
 
     def test_supporting_article_default_classification(self):
         found = retrieve_law_articles(["47", "53", "58"], LawClauseRetriever("raw_law.json"))
@@ -230,6 +264,48 @@ class ReasoningActTests(unittest.TestCase):
         self.assertEqual(mitigation.court_sentence, "02 năm tù")
         self.assertEqual(aggravation.doc_id, "case-c")
         self.assertEqual(aggravation.court_aggravation, "Phạm tội nhiều lần")
+
+    def test_sentencing_calibration_caps_final_cases_per_issue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            train_dir = Path(tmp)
+            train_articles_index = {}
+            for prefix, field_name in (("mit", "Giam_nhe"), ("agg", "Tang_nang")):
+                for idx in range(8):
+                    doc_id = f"{prefix}-{idx}"
+                    train_articles_index[doc_id] = {"dieu_only": {"174"}, "full_signature": {"174"}}
+                    (train_dir / f"{doc_id}.json").write_text(
+                        json.dumps(
+                            {
+                                "Ma_Ban_An": doc_id,
+                                "PHAN_QUYET_CUA_TOA_SO_THAM": [
+                                    {
+                                        "Bi_Cao": f"{prefix.upper()}{idx}",
+                                        "Phat_Tu": "02 năm tù",
+                                        field_name: f"{prefix} factor {idx}",
+                                    }
+                                ],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+
+            cases = retrieve_sentencing_calibration_cases(
+                runtime=ManyCalibrationRuntime(),
+                train_dir=train_dir,
+                train_articles_index=train_articles_index,
+                mitigation_factors=["mitigation factor 1", "mitigation factor 2"],
+                aggravation_factors=["aggravation factor 1", "aggravation factor 2"],
+                selected_dieu="174",
+                exclude_doc_id="test",
+                top_k_per_factor=3,
+                broad_top_k=8,
+            )
+
+        mitigation_cases = [item for item in cases if item.factor_type == "mitigation"]
+        aggravation_cases = [item for item in cases if item.factor_type == "aggravation"]
+        self.assertLessEqual(len(mitigation_cases), 5)
+        self.assertLessEqual(len(aggravation_cases), 5)
 
 
 if __name__ == "__main__":

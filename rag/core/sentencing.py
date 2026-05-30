@@ -65,6 +65,14 @@ def extract_imprisonment_months(text: str | None) -> int:
     if any(marker in cleaned for marker in non_custodial_markers):
         return 0
 
+    # Parenthetical explanations may contain the controlling combined sentence.
+    # Check life imprisonment before removing those explanations.
+    if re.search(r"hinh phat chung[^.;\n]{0,120}\bchung than\b", lowered):
+        return LIFE_IMPRISONMENT_MONTHS
+    for m in re.finditer(r"tong hop", lowered):
+        if "chung than" in lowered[m.start():]:
+            return LIFE_IMPRISONMENT_MONTHS
+
     # 1) Prefer final combined sentence after "tong hop".
     for m in re.finditer(r"tong hop[^.;,:\n]*", cleaned):
         frag = m.group(0)

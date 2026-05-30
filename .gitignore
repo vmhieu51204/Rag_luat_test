@@ -18,3 +18,6 @@ output/**/link_lists.bin
 
 save.md
 
+act_full.json.before_malformed_filter.bak
+analysis_act_full.txt
+act_full.json.bak

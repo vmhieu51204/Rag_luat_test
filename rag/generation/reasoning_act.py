@@ -11,9 +11,10 @@ from typing import Any
 from pydantic import ValidationError
 
 from rag.config import VERDICT_FIELD
-from rag.core.law_retriever import LawClauseRetriever
+from rag.core.law_retriever import LawClauseRetriever, parse_clause_signature
 from rag.evaluation.eval_utils import load_articles_index
 from rag.generation.schemas import (
+    AdditionalLawQuery,
     CandidateOffence,
     ReasonActAnalysisOutput,
     ReasonActFinalOutput,
@@ -37,6 +38,7 @@ DEFAULT_REASON_ACT_TRAIN_FIELDS = ["NHAN_DINH_CUA_TOA_AN.[2]"]
 MITIGATION_EMBED_FIELD = "PHAN_QUYET_CUA_TOA_SO_THAM.Giam_nhe"
 AGGRAVATION_EMBED_FIELD = "PHAN_QUYET_CUA_TOA_SO_THAM.Tang_nang"
 DEFAULT_SENTENCING_CALIBRATION_FIELDS = [AGGRAVATION_EMBED_FIELD, MITIGATION_EMBED_FIELD]
+MAX_FINAL_CASES_PER_ISSUE = 5
 SYNTHETIC_SUMMARY_FORMAT_NOTE = (
     "case_fields.Synthetic_summary may be a JSON array encoded as a string. "
     "Each array item is a separate first-person story for one defendant. "
@@ -136,14 +138,113 @@ def _retrieved_article_from_result(signature: str, result: dict[str, Any]) -> Re
     )
 
 
+def _canonical_law_signature(signature: Any) -> str | None:
+    raw = str(signature or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = parse_clause_signature(raw)
+    except ValueError:
+        return raw
+    out = parsed.dieu
+    if parsed.khoan is not None:
+        out += f"-{parsed.khoan}"
+    if parsed.diem is not None:
+        out += f"-{parsed.diem}"
+    return out
+
+
+def _signature_dieu_and_is_full(signature: Any) -> tuple[str, bool] | None:
+    canonical = _canonical_law_signature(signature)
+    if not canonical:
+        return None
+    try:
+        parsed = parse_clause_signature(canonical)
+    except ValueError:
+        return None
+    return parsed.dieu, parsed.khoan is None
+
+
+def compact_law_signatures(signatures: list[str]) -> list[str]:
+    parsed_items: list[tuple[str, str | None, bool]] = []
+    full_dieu: set[str] = set()
+    for raw_sig in signatures:
+        signature = str(raw_sig or "").strip()
+        if not signature:
+            continue
+        canonical = _canonical_law_signature(signature)
+        is_full = False
+        dieu: str | None = None
+        if canonical:
+            parsed = _signature_dieu_and_is_full(canonical)
+            if parsed is not None:
+                dieu, is_full = parsed
+                if is_full:
+                    full_dieu.add(dieu)
+        parsed_items.append((signature, dieu, is_full))
+
+    compacted: list[str] = []
+    seen: set[str] = set()
+    for signature, dieu, is_full in parsed_items:
+        if dieu in full_dieu and not is_full:
+            continue
+        key = _canonical_law_signature(signature) or signature
+        if key in seen:
+            continue
+        seen.add(key)
+        compacted.append(signature)
+    return compacted
+
+
+def _existing_law_coverage(articles: list[RetrievedLawArticle]) -> tuple[set[str], set[str]]:
+    full_dieu: set[str] = set()
+    signatures: set[str] = set()
+    for item in articles:
+        canonical = _canonical_law_signature(item.signature)
+        if not canonical:
+            continue
+        signatures.add(canonical)
+        parsed = _signature_dieu_and_is_full(canonical)
+        if item.found and item.level == "dieu" and parsed is not None and parsed[1]:
+            full_dieu.add(parsed[0])
+    return full_dieu, signatures
+
+
+def _filter_new_law_signatures(
+    signatures: list[str],
+    existing_articles: list[RetrievedLawArticle],
+) -> list[str]:
+    full_dieu, existing_signatures = _existing_law_coverage(existing_articles)
+    new_signatures: list[str] = []
+    for signature in compact_law_signatures(signatures):
+        canonical = _canonical_law_signature(signature)
+        if not canonical or canonical in existing_signatures:
+            continue
+        parsed = _signature_dieu_and_is_full(canonical)
+        if parsed is not None and not parsed[1] and parsed[0] in full_dieu:
+            continue
+        new_signatures.append(signature)
+    return new_signatures
+
+
+def _additional_law_query_signatures(queries: list[AdditionalLawQuery]) -> list[str]:
+    signatures: list[str] = []
+    for query in queries:
+        signature = _normalize_space(query.signature)
+        if signature:
+            signatures.append(signature)
+    return signatures
+
+
 def retrieve_law_articles(signatures: list[str], law_retriever: LawClauseRetriever) -> list[RetrievedLawArticle]:
     articles: list[RetrievedLawArticle] = []
     seen: set[str] = set()
-    for raw_sig in signatures:
+    for raw_sig in compact_law_signatures(signatures):
         signature = str(raw_sig or "").strip()
-        if not signature or signature in seen:
+        key = _canonical_law_signature(signature) or signature
+        if not signature or key in seen:
             continue
-        seen.add(signature)
+        seen.add(key)
         result = law_retriever.retrieve(signature)
         articles.append(_retrieved_article_from_result(signature, result))
     return articles
@@ -424,6 +525,7 @@ def retrieve_similar_cases(
     broad_top_k: int = 64,
     top_k: int = 5,
 ) -> list[SimilarCaseSummary]:
+    top_k = min(top_k, MAX_FINAL_CASES_PER_ISSUE)
     if not query_text or not selected_dieu or top_k <= 0:
         return []
 
@@ -459,9 +561,7 @@ def retrieve_similar_cases(
         tokens = _tokenize(profile)
         overlap = len(query_tokens & tokens) / max(len(query_tokens), 1)
         has_sentence = 0.15 if _sentence_for_selected_dieu(data, selected_dieu) else 0.0
-        has_mitigation = 0.10 if re.search(r"Điều\s*51|dieu\s*51|Giam_nhe|Giảm nhẹ", profile, re.IGNORECASE) else 0.0
-        has_aggravation = 0.10 if re.search(r"Điều\s*52|dieu\s*52|Tang_nang|Tăng nặng", profile, re.IGNORECASE) else 0.0
-        ranked.append((base_score + overlap + has_sentence + has_mitigation + has_aggravation, rid))
+        ranked.append((base_score + overlap + has_sentence, rid))
 
     ranked.sort(reverse=True)
     return [_summarize_similar_case(train_docs[rid], rid, selected_dieu) for _, rid in ranked[:top_k]]
@@ -478,8 +578,9 @@ def retrieve_sentencing_calibration_cases(
     exclude_doc_id: str | None,
     top_k_per_factor: int = 3,
     broad_top_k: int = 64,
+    max_cases_per_issue: int = MAX_FINAL_CASES_PER_ISSUE,
 ) -> list[SentencingCalibrationCase]:
-    if top_k_per_factor <= 0 or not selected_dieu:
+    if top_k_per_factor <= 0 or max_cases_per_issue <= 0 or not selected_dieu:
         return []
 
     train_docs = _load_train_doc_map(train_dir)
@@ -491,8 +592,15 @@ def retrieve_sentencing_calibration_cases(
         for factor in _unique_text_items(aggravation_factors)
     ]
     calibration_cases: list[SentencingCalibrationCase] = []
+    issue_counts: dict[str, int] = {"mitigation": 0, "aggravation": 0}
+    issue_seen: dict[str, set[tuple[str, str | None, str | None]]] = {
+        "mitigation": set(),
+        "aggravation": set(),
+    }
 
     for factor_type, target_field, factor in queries:
+        if issue_counts[factor_type] >= max_cases_per_issue:
+            continue
         n_fetch = max(broad_top_k, top_k_per_factor * 16)
         cap = max(n_fetch, top_k_per_factor * 80)
         factor_cases: list[SentencingCalibrationCase] = []
@@ -522,9 +630,11 @@ def retrieve_sentencing_calibration_cases(
                 verdict = _verdict_item_from_metadata(data, meta)
                 if not verdict:
                     continue
+                if issue_counts[factor_type] + len(factor_cases) >= max_cases_per_issue:
+                    break
                 defendant_name = _normalize_space(verdict.get("Bi_Cao")) or None
                 seen_key = (rid, defendant_name, target_field)
-                if seen_key in seen:
+                if seen_key in seen or seen_key in issue_seen[factor_type]:
                     continue
                 seen.add(seen_key)
                 score = 1.0 - float(distance or 0.0)
@@ -545,11 +655,20 @@ def retrieve_sentencing_calibration_cases(
                 if len(factor_cases) >= top_k_per_factor:
                     break
 
-            if len(factor_cases) >= top_k_per_factor or n_fetch >= cap:
+            if (
+                len(factor_cases) >= top_k_per_factor
+                or issue_counts[factor_type] + len(factor_cases) >= max_cases_per_issue
+                or n_fetch >= cap
+            ):
                 break
             n_fetch = min(n_fetch * 2, cap)
 
-        calibration_cases.extend(factor_cases[:top_k_per_factor])
+        remaining = max_cases_per_issue - issue_counts[factor_type]
+        selected_factor_cases = factor_cases[: min(top_k_per_factor, remaining)]
+        calibration_cases.extend(selected_factor_cases)
+        issue_counts[factor_type] += len(selected_factor_cases)
+        for item in selected_factor_cases:
+            issue_seen[factor_type].add((item.doc_id, item.defendant_name, item.matched_field))
 
     return calibration_cases
 
@@ -613,7 +732,9 @@ def _legal_analysis_prompt(
     doc_id: str,
     facts_and_candidates: ReasonActAnalysisOutput,
     offence_articles: list[RetrievedLawArticle],
+    additional_articles: list[RetrievedLawArticle],
     supporting_articles: list[RetrievedLawArticle],
+    additional_law_round: int = 0,
 ) -> tuple[str, str]:
     system = "You are a Vietnamese criminal law judgment assistant. Return only valid JSON."
     payload = {
@@ -621,10 +742,25 @@ def _legal_analysis_prompt(
         "facts": facts_and_candidates.facts.model_dump(),
         "candidates": [item.model_dump() for item in facts_and_candidates.candidates],
         "retrieved_offence_articles": [item.model_dump() for item in offence_articles],
+        "retrieved_additional_articles": [item.model_dump() for item in additional_articles],
         "retrieved_supporting_articles": [item.model_dump() for item in supporting_articles],
+        "additional_law_round": additional_law_round,
         "rules": [
             "Statutory law controls charge and sentencing-frame selection.",
-            "Select the likely offence and sentencing bracket from retrieved law only.",
+            (
+                "Select the likely offence and sentencing bracket from retrieved law only when the retrieved law covers "
+                "the case facts."
+            ),
+            (
+                "If the retrieved offence/supporting law appears incorrect, incomplete, or does not fully cover the "
+                "case facts, "
+                "put exact BLHS signatures in additional_law_queries with concise reasons."
+            ),
+            (
+                "Prefer Dieu-level additional_law_queries when a whole article is needed; do not request smaller "
+                "clauses inside an already retrieved full article."
+            ),
+            "If additional law is needed, still provide the best provisional selected_offence from the available law.",
             "Reject or downgrade every non-selected candidate with a concise reason.",
             "Classify every supporting article as applicable, fact_dependent, not_applicable, or not_retrieved.",
             "For every supporting article status, explain the factual trigger.",
@@ -643,6 +779,7 @@ def _final_prompt(
     case_payload: dict[str, str],
     legal_analysis: ReasonActLegalAnalysis,
     offence_articles: list[RetrievedLawArticle],
+    additional_articles: list[RetrievedLawArticle],
     supporting_articles: list[RetrievedLawArticle],
     similar_cases: list[SimilarCaseSummary],
     sentencing_calibration_cases: list[SentencingCalibrationCase],
@@ -659,12 +796,17 @@ def _final_prompt(
         },
         "legal_analysis": legal_analysis.model_dump(),
         "retrieved_offence_articles": [item.model_dump() for item in offence_articles if item.found],
+        "retrieved_additional_articles": [item.model_dump() for item in additional_articles if item.found],
         "retrieved_supporting_articles": [item.model_dump() for item in supporting_articles],
         "similar_cases_for_analogy_only": [item.model_dump() for item in similar_cases],
         "sentencing_calibration_cases": [item.model_dump() for item in sentencing_calibration_cases],
         "rules": [
             "Produce final prediction in GenerationOutput.",
             "When Synthetic_summary is a list, generate one matching defendants item per story and preserve the defendant name from that story.",
+            (
+                "Use retrieved_offence_articles and retrieved_additional_articles as the statutory "
+                "offence/sentencing-frame context."
+            ),
             "Include only actually applicable clauses in Applied_Law_Clauses.",
             "Do not include checked-but-not-applicable or fact-dependent articles in Applied_Law_Clauses.",
             "Use similar cases only for analogy and sentencing calibration, never to override statutory law.",
@@ -698,6 +840,7 @@ def run_reasoning_act(
     query_fields: list[str] | None = None,
     broad_top_k_case: int = 64,
     top_k_case: int = 5,
+    max_additional_law_rounds: int = 1,
 ) -> dict[str, Any]:
     input_fields = input_fields or ["THONG_TIN_CHUNG.Thong_Tin_Bi_Cao", "Synthetic_summary"]
     query_fields = query_fields or ["Synthetic_summary", "THONG_TIN_CHUNG.Thong_Tin_Bi_Cao"]
@@ -726,11 +869,13 @@ def run_reasoning_act(
         selected_offence_text=found_offence_text,
         law_retriever=law_retriever,
     )
+    additional_articles: list[RetrievedLawArticle] = []
 
     system, user = _legal_analysis_prompt(
         doc_id=doc_id,
         facts_and_candidates=facts_and_candidates,
         offence_articles=offence_articles,
+        additional_articles=additional_articles,
         supporting_articles=supporting_articles,
     )
     legal_analysis, call_usage = _call_llm(
@@ -748,8 +893,43 @@ def run_reasoning_act(
     )
     usage["calls"].append({"name": "legal_analysis", **call_usage})
 
+    for round_idx in range(max(max_additional_law_rounds, 0)):
+        requested_signatures = _additional_law_query_signatures(legal_analysis.additional_law_queries)
+        new_signatures = _filter_new_law_signatures(
+            requested_signatures,
+            offence_articles + supporting_articles + additional_articles,
+        )
+        if not new_signatures:
+            break
+        additional_articles.extend(retrieve_law_articles(new_signatures, law_retriever))
+        system, user = _legal_analysis_prompt(
+            doc_id=doc_id,
+            facts_and_candidates=facts_and_candidates,
+            offence_articles=offence_articles,
+            additional_articles=additional_articles,
+            supporting_articles=supporting_articles,
+            additional_law_round=round_idx + 1,
+        )
+        legal_analysis, call_usage = _call_llm(
+            provider=provider,
+            model_name=model_name,
+            system_prompt=system,
+            user_prompt=user,
+            output_model=ReasonActLegalAnalysis,
+            use_provider_fallback=use_provider_fallback,
+        )
+        legal_analysis.supporting_article_assessments = ensure_mandatory_supporting_assessments(
+            legal_analysis.supporting_article_assessments,
+            supporting_articles,
+            case_text=case_text,
+        )
+        usage["calls"].append({"name": "legal_analysis_additional_law", "round": round_idx + 1, **call_usage})
+
     selected_dieu = legal_analysis.selected_offence.Dieu
-    if selected_dieu and all(item.signature != selected_dieu for item in offence_articles):
+    selected_key = _canonical_law_signature(selected_dieu)
+    all_retrieved_articles = offence_articles + additional_articles
+    _, all_retrieved_signatures = _existing_law_coverage(all_retrieved_articles)
+    if selected_key and selected_key not in all_retrieved_signatures:
         offence_articles.extend(retrieve_law_articles([selected_dieu], law_retriever))
 
     similar_cases = retrieve_similar_cases(
@@ -779,6 +959,7 @@ def run_reasoning_act(
         case_payload=case_payload,
         legal_analysis=legal_analysis,
         offence_articles=offence_articles,
+        additional_articles=additional_articles,
         supporting_articles=supporting_articles,
         similar_cases=similar_cases,
         sentencing_calibration_cases=sentencing_calibration_cases,
@@ -800,7 +981,9 @@ def run_reasoning_act(
         aggravation_factors=facts_and_candidates.aggravation_factors,
         selected_offence=final_output.legal_analysis.selected_offence,
         rejected_candidates=final_output.legal_analysis.rejected_candidates,
+        additional_law_queries=final_output.legal_analysis.additional_law_queries,
         retrieved_offence_articles=offence_articles,
+        retrieved_additional_articles=additional_articles,
         retrieved_supporting_articles=supporting_articles,
         supporting_article_assessments=ensure_mandatory_supporting_assessments(
             final_output.legal_analysis.supporting_article_assessments,

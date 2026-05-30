@@ -135,6 +135,15 @@ class SupportingArticleAssessment(BaseModel):
     factual_trigger: str | None = Field(default=None, description="Facts triggering this classification.")
     explanation: str | None = Field(default=None, description="Concise legal explanation.")
 
+
+class AdditionalLawQuery(BaseModel):
+    signature: str = Field(description="Exact BLHS signature to retrieve, e.g. 174, 174-2, or 174-2-a.")
+    reason: str | None = Field(
+        default=None,
+        description="Why the currently retrieved law is incorrect, incomplete, or insufficient for the case facts.",
+    )
+
+
 class SimilarCaseSummary(BaseModel):
     doc_id: str = Field(description="Similar train-case document id.")
     matched_offence_article: str | None = Field(default=None, description="Selected offence article matched in this case.")
@@ -184,6 +193,14 @@ class ReasonActAnalysisOutput(BaseModel):
 class ReasonActLegalAnalysis(BaseModel):
     selected_offence: CandidateOffence = Field(description="Likely offence and sentencing bracket selected from retrieved law.")
     rejected_candidates: list[CandidateOffence] = Field(default_factory=list, description="Rejected or downgraded candidates.")
+    additional_law_queries: list[AdditionalLawQuery] = Field(
+        default_factory=list,
+        description=(
+            "Additional exact BLHS law signatures that should be retrieved when the provided law text appears "
+            "incorrect, "
+            "incomplete, or does not fully cover the case facts. Leave empty when no additional law is needed."
+        ),
+    )
     supporting_article_assessments: list[SupportingArticleAssessment] = Field(
         default_factory=list,
         description="Classification for every mandatory and offence-specific supporting article.",
@@ -205,7 +222,9 @@ class ReasonActTrace(BaseModel):
     aggravation_factors: list[str] = Field(default_factory=list)
     selected_offence: CandidateOffence | None = Field(default=None, description="Selected offence from statutory matching.")
     rejected_candidates: list[CandidateOffence] = Field(default_factory=list, description="Rejected/downgraded candidates.")
+    additional_law_queries: list[AdditionalLawQuery] = Field(default_factory=list)
     retrieved_offence_articles: list[RetrievedLawArticle] = Field(default_factory=list)
+    retrieved_additional_articles: list[RetrievedLawArticle] = Field(default_factory=list)
     retrieved_supporting_articles: list[RetrievedLawArticle] = Field(default_factory=list)
     supporting_article_assessments: list[SupportingArticleAssessment] = Field(default_factory=list)
     similar_cases: list[SimilarCaseSummary] = Field(default_factory=list)

@@ -67,6 +67,7 @@ def _evaluate_single_doc(
     query_fields: list[str],
     broad_top_k_case: int,
     top_k_case: int,
+    max_additional_law_rounds: int,
     provider: LLMProvider,
     model_name: str,
     only_blhs: bool,
@@ -89,6 +90,7 @@ def _evaluate_single_doc(
         query_fields=query_fields,
         broad_top_k_case=broad_top_k_case,
         top_k_case=top_k_case,
+        max_additional_law_rounds=max_additional_law_rounds,
     )
 
     if react_result is None:
@@ -185,9 +187,11 @@ def _evaluate_single_doc(
         },
         "retrieved_law": {
             "offence_articles": trace_dict.get("retrieved_offence_articles", []),
+            "additional_articles": trace_dict.get("retrieved_additional_articles", []),
             "supporting_articles": trace_dict.get("retrieved_supporting_articles", []),
             "mandatory_supporting_articles": list(MANDATORY_SUPPORTING_DIEU),
         },
+        "additional_law_queries": trace_dict.get("additional_law_queries", []),
         "supporting_article_assessments": trace_dict.get("supporting_article_assessments", []),
         "rejected_candidates": trace_dict.get("rejected_candidates", []),
         "missing_facts": trace_dict.get("missing_facts", []),
@@ -226,7 +230,7 @@ def main() -> None:
     parser.add_argument("--max-chunk-chars", type=int, default=DEFAULT_MAX_CHUNK_CHARS)
     parser.add_argument(
         "--input-fields",
-        default="THONG_TIN_CHUNG.Thong_Tin_Bi_Cao,Synthetic_summary",
+        default="THONG_TIN_CHUNG.Thong_Tin_Bi_Cao,Synthetic_summary_2",
         help=(
             "Comma-separated fields passed to the ReAct LLM prompts. "
             "Synthetic_summary may be a list of separate first-person defendant stories."
@@ -243,6 +247,12 @@ def main() -> None:
     )
     parser.add_argument("--broad-top-k-case", type=int, default=64)
     parser.add_argument("--top-k-case", type=int, default=5)
+    parser.add_argument(
+        "--max-additional-law-rounds",
+        type=int,
+        default=1,
+        help="Maximum extra legal-analysis rounds after the model requests additional BLHS signatures.",
+    )
     parser.add_argument("--first-n", type=int, default=None)
     parser.add_argument("--only-blhs", action="store_true", default=True)
     parser.add_argument("--include-non-blhs", action="store_false", dest="only_blhs")
@@ -271,6 +281,8 @@ def main() -> None:
         raise ValueError("--top-k-case must be >= 1")
     if args.broad_top_k_case < args.top_k_case:
         raise ValueError("--broad-top-k-case must be >= --top-k-case")
+    if args.max_additional_law_rounds < 0:
+        raise ValueError("--max-additional-law-rounds must be >= 0")
 
     input_fields = _parse_fields(args.input_fields)
     query_fields = _parse_fields(args.query_fields)
@@ -317,6 +329,7 @@ def main() -> None:
     print(f"Train embedding fields={train_embedding_fields}")
     print(f"Synthetic_summary format={SYNTHETIC_SUMMARY_FORMAT_NOTE}")
     print(f"Mandatory supporting articles={list(MANDATORY_SUPPORTING_DIEU)}")
+    print(f"Max additional law rounds={args.max_additional_law_rounds}")
     print(f"Train label index size={len(train_articles_index)} (skipped={len(train_skipped)})")
 
     per_doc: list[dict[str, Any]] = []
@@ -348,6 +361,7 @@ def main() -> None:
         "synthetic_summary_format": SYNTHETIC_SUMMARY_FORMAT_NOTE,
         "broad_top_k_case": args.broad_top_k_case,
         "top_k_case": args.top_k_case,
+        "max_additional_law_rounds": args.max_additional_law_rounds,
         "mandatory_supporting_articles": list(MANDATORY_SUPPORTING_DIEU),
         "only_blhs": args.only_blhs,
         "n_train_label_index": len(train_articles_index),
@@ -371,6 +385,7 @@ def main() -> None:
             query_fields=query_fields,
             broad_top_k_case=args.broad_top_k_case,
             top_k_case=args.top_k_case,
+            max_additional_law_rounds=args.max_additional_law_rounds,
             provider=provider,
             model_name=model_name,
             only_blhs=args.only_blhs,
