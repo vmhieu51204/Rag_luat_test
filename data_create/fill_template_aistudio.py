@@ -4,7 +4,7 @@ import glob
 import argparse
 import time
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import Any, List, Optional
 from dotenv import load_dotenv
 
 from data_create.schemas import (
@@ -23,23 +23,87 @@ from google.genai import types
 # 0. MODEL CONFIGURATION
 # ==========================================
 # Lazy-initialised client handles
-_genai_client = None
+_client_cache: dict[tuple[str, int | None, int | None], Any] = {}
 _openrouter_client = None
- 
-def get_genai_client():
-    """Lazily initialize and return a Google GenAI client."""
-    global _genai_client
-    if _genai_client is None:
-        api_key = os.environ.get("GOOGLE_API_KEY")
-        if not api_key:
-            raise EnvironmentError(
-                "GOOGLE_API_KEY environment variable is not set. "
-                "Get one at https://aistudio.google.com/app/apikey"
-            )
-        _genai_client = genai.Client(api_key=api_key)
-    return _genai_client
 
-def get_openrouter_client():
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 300
+DEFAULT_RETRY_ATTEMPTS = 1
+
+
+def get_aistudio_api_keys() -> list[tuple[str, str]]:
+    """Return configured AI Studio API keys in the order they should be tried."""
+    key_names = ("GOOGLE_API_KEY", "GOOGLE_API_KEY_2", "GOOGLE_API_KEY_3")
+    return [
+        (key_name, api_key)
+        for key_name in key_names
+        if (api_key := os.environ.get(key_name))
+    ]
+
+
+def build_http_options(
+    request_timeout_seconds: float | None = None,
+    retry_attempts: int | None = None,
+) -> tuple[types.HttpOptions | None, int | None, int | None]:
+    timeout_ms = None
+    if request_timeout_seconds is not None and request_timeout_seconds > 0:
+        timeout_ms = int(request_timeout_seconds * 1000)
+
+    resolved_retry_attempts = None
+    if retry_attempts is not None:
+        resolved_retry_attempts = max(1, int(retry_attempts))
+
+    http_options = None
+    if timeout_ms is not None or resolved_retry_attempts is not None:
+        http_options = types.HttpOptions(timeout=timeout_ms)
+        if resolved_retry_attempts is not None:
+            http_options.retry_options = types.HttpRetryOptions(
+                attempts=resolved_retry_attempts
+            )
+
+    return http_options, timeout_ms, resolved_retry_attempts
+
+
+def get_genai_clients(
+    request_timeout_seconds: float | None = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    retry_attempts: int | None = DEFAULT_RETRY_ATTEMPTS,
+) -> list[dict[str, Any]]:
+    """Lazily initialize one Google GenAI client for each configured API key."""
+    api_keys = get_aistudio_api_keys()
+    if not api_keys:
+        raise EnvironmentError(
+            "No AI Studio API keys are set. Expected GOOGLE_API_KEY, "
+            "GOOGLE_API_KEY_2, and/or GOOGLE_API_KEY_3."
+        )
+
+    http_options, timeout_ms, resolved_retry_attempts = build_http_options(
+        request_timeout_seconds=request_timeout_seconds,
+        retry_attempts=retry_attempts,
+    )
+
+    clients: list[dict[str, Any]] = []
+    init_errors: list[str] = []
+    for key_name, api_key in api_keys:
+        cache_key = (key_name, timeout_ms, resolved_retry_attempts)
+        try:
+            if cache_key not in _client_cache:
+                _client_cache[cache_key] = genai.Client(
+                    api_key=api_key,
+                    http_options=http_options,
+                )
+            clients.append({"key_name": key_name, "client": _client_cache[cache_key]})
+        except Exception as exc:
+            init_errors.append(f"{key_name}: {exc}")
+
+    if not clients:
+        raise EnvironmentError(
+            "No AI Studio clients could be initialized. Errors: "
+            + " | ".join(init_errors)
+        )
+
+    return clients
+
+
+def get_openrouter_client(request_timeout_seconds: float | None = None):
     """Lazily initialize and return an OpenRouter client."""
     global _openrouter_client
     if _openrouter_client is None:
@@ -47,10 +111,15 @@ def get_openrouter_client():
         api_key = os.environ.get("OPENROUTER_API_KEY")
         if not api_key:
             raise EnvironmentError("OPENROUTER_API_KEY environment variable is not set.")
+        timeout = (
+            request_timeout_seconds
+            if request_timeout_seconds and request_timeout_seconds > 0
+            else 30.0
+        )
         _openrouter_client = OpenAI(
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
-            timeout=30.0,
+            timeout=timeout,
             max_retries=0,
         )
     return _openrouter_client
@@ -195,53 +264,80 @@ def call_model(
     system_prompt: str,
     user_content: str,
     schema: type,
+    request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS,
 ) -> tuple[BaseModel, dict]:
     """
     Call the model with fallback:
-    1. AI Studio (gemma-4-31b-it)
+    1. AI Studio (gemma-4-31b-it) across GOOGLE_API_KEY, GOOGLE_API_KEY_2,
+       and GOOGLE_API_KEY_3 in order.
     2. OpenRouter (google/gemma-4-31b-it:free)
     3. OpenRouter (google/gemma-4-31b-it)
     """
     full_prompt = f"{system_prompt.strip()}\n\n{user_content.strip()}"
     errors = []
 
-    # 1. AI Studio
+    # 1. AI Studio key rotation
     try:
-        client = get_genai_client()
-        generation_config = types.GenerateContentConfig(
-            temperature=0.0,
-            response_mime_type="application/json",
-            response_schema=get_response_schema(schema),
+        clients = get_genai_clients(
+            request_timeout_seconds=request_timeout_seconds,
+            retry_attempts=retry_attempts,
         )
-        response = client.models.generate_content(
-            model="gemma-4-31b-it",
-            contents=full_prompt,
-            config=generation_config,
-        )
-        
-        usage_meta = getattr(response, "usage_metadata", None)
-        prompt_tokens      = getattr(usage_meta, "prompt_token_count",      0) or 0
-        completion_tokens  = getattr(usage_meta, "candidates_token_count",  0) or 0
-        total_tokens       = getattr(usage_meta, "total_token_count", prompt_tokens + completion_tokens) or 0
-        
-        usage = {
-            "prompt_tokens":     prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens":      total_tokens,
-            "provider":          "aistudio",
-            "model":             "gemma-4-31b-it",
-        }
-        
-        raw_text = getattr(response, "text", "") or ""
-        parsed = parse_llm_json(raw_text, schema)
-        return parsed, usage
     except Exception as e:
-        error_msg = f"AI Studio failed: {e}"
+        clients = []
+        error_msg = f"AI Studio client initialization failed: {e}"
         errors.append(error_msg)
         print(f"    [Fallback] {error_msg}")
 
+    generation_config = types.GenerateContentConfig(
+        temperature=0.0,
+        response_mime_type="application/json",
+        response_schema=get_response_schema(schema),
+    )
+
+    for client_info in clients:
+        key_name = str(client_info.get("key_name") or "unknown_key")
+        client = client_info["client"]
+        try:
+            print(f"    Calling AI Studio with {key_name}...")
+            try:
+                response = client.models.generate_content(
+                    model="gemma-4-31b-it",
+                    contents=full_prompt,
+                    config=generation_config,
+                    request_options={"timeout": request_timeout_seconds},
+                )
+            except TypeError:
+                response = client.models.generate_content(
+                    model="gemma-4-31b-it",
+                    contents=full_prompt,
+                    config=generation_config,
+                )
+
+            usage_meta = getattr(response, "usage_metadata", None)
+            prompt_tokens      = getattr(usage_meta, "prompt_token_count",      0) or 0
+            completion_tokens  = getattr(usage_meta, "candidates_token_count",  0) or 0
+            total_tokens       = getattr(usage_meta, "total_token_count", prompt_tokens + completion_tokens) or 0
+
+            usage = {
+                "prompt_tokens":     prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens":      total_tokens,
+                "provider":          "aistudio",
+                "key_name":          key_name,
+                "model":             "gemma-4-31b-it",
+            }
+
+            raw_text = getattr(response, "text", "") or ""
+            parsed = parse_llm_json(raw_text, schema)
+            return parsed, usage
+        except Exception as e:
+            error_msg = f"AI Studio ({key_name}) failed: {e}"
+            errors.append(error_msg)
+            print(f"    [Fallback] {error_msg}")
+
     # Fallbacks via OpenRouter
-    or_client = get_openrouter_client()
+    or_client = get_openrouter_client(request_timeout_seconds)
     
     fallback_models = [
         "google/gemma-4-31b-it:free",
@@ -257,6 +353,7 @@ def call_model(
                     {"role": "user", "content": user_content},
                 ],
                 temperature=0.0,
+                timeout=request_timeout_seconds,
             )
             raw_text = response.choices[0].message.content or ""
             parsed = parse_llm_json(raw_text, schema)
@@ -287,7 +384,13 @@ def call_model(
 # ==========================================
 # 3. CORE PROCESSING LOGIC
 # ==========================================
-def process_caselaw_file(input_filepath: str, output_filepath: str, skip_existing: bool = True) -> tuple[float, str]:
+def process_caselaw_file(
+    input_filepath: str,
+    output_filepath: str,
+    skip_existing: bool = True,
+    request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS,
+) -> tuple[float, str]:
     """
     Processes a single stage2 JSON file, extracts data using Gemma 4 31B via
     Google AI Studio, saves the result to stage3, and returns the cost in USD.
@@ -341,6 +444,7 @@ def process_caselaw_file(input_filepath: str, output_filepath: str, skip_existin
             "total_tokens":       total_tok,
             "cost_usd":           round(call_cost, 6),
             "provider":           usage.get("provider", "unknown"),
+            "key_name":           usage.get("key_name"),
             "model":              model_used,
         })
  
@@ -410,7 +514,11 @@ JSON SCHEMA:
     try:
         print(f"  --> Generating {filename} (this may take 1-3 minutes)...")
         extracted_data, usage = call_model(
-            system_prompt, llm_input_context, LLMExtractionOutput
+            system_prompt,
+            llm_input_context,
+            LLMExtractionOutput,
+            request_timeout_seconds=request_timeout_seconds,
+            retry_attempts=retry_attempts,
         )
         provider = usage.get("provider", "unknown")
         add_usage_call("llm_extraction", usage)
@@ -479,7 +587,13 @@ JSON SCHEMA:
 # ==========================================
 # 4. BATCH PROCESSING & AGGREGATION
 # ==========================================
-def process_directory(input_dir: str, output_dir: str, skip_existing: bool = True):
+def process_directory(
+    input_dir: str,
+    output_dir: str,
+    skip_existing: bool = True,
+    request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS,
+):
     """Process all JSON files in input_dir and write results to output_dir."""
     total_pipeline_cost = 0.0
     skipped_count       = 0
@@ -495,7 +609,13 @@ def process_directory(input_dir: str, output_dir: str, skip_existing: bool = Tru
     for input_file in input_files:
         filename    = os.path.basename(input_file)
         output_file = os.path.join(output_dir, filename.replace("stage2", "stage3"))
-        cost, status = process_caselaw_file(input_file, output_file, skip_existing=skip_existing)
+        cost, status = process_caselaw_file(
+            input_file,
+            output_file,
+            skip_existing=skip_existing,
+            request_timeout_seconds=request_timeout_seconds,
+            retry_attempts=retry_attempts,
+        )
         if status == "skipped":
             skipped_count += 1
         elif status == "failed":
@@ -522,7 +642,14 @@ def process_directory(input_dir: str, output_dir: str, skip_existing: bool = Tru
     print(f"FINAL TOTAL COST: ${total_pipeline_cost:.4f}")
  
  
-def process_selected_files(input_dir: str, output_dir: str, selected_filenames: List[str], skip_existing: bool = True):
+def process_selected_files(
+    input_dir: str,
+    output_dir: str,
+    selected_filenames: List[str],
+    skip_existing: bool = True,
+    request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS,
+):
     """Process only the specified filenames from input_dir."""
     total_pipeline_cost = 0.0
     skipped_count       = 0
@@ -549,7 +676,13 @@ def process_selected_files(input_dir: str, output_dir: str, selected_filenames: 
     for input_file in existing_files:
         filename    = os.path.basename(input_file)
         output_file = os.path.join(output_dir, filename.replace("stage2", "stage3"))
-        cost, status = process_caselaw_file(input_file, output_file, skip_existing=skip_existing)
+        cost, status = process_caselaw_file(
+            input_file,
+            output_file,
+            skip_existing=skip_existing,
+            request_timeout_seconds=request_timeout_seconds,
+            retry_attempts=retry_attempts,
+        )
         if status == "skipped":
             skipped_count += 1
         elif status == "failed":
@@ -624,6 +757,18 @@ if __name__ == "__main__":
         default=False,
         help="Re-process and overwrite files that already exist in the output directory",
     )
+    parser.add_argument(
+        "--request-timeout-seconds",
+        type=float,
+        default=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        help="Timeout in seconds for each model request",
+    )
+    parser.add_argument(
+        "--retry-attempts",
+        type=int,
+        default=DEFAULT_RETRY_ATTEMPTS,
+        help="Max attempts per AI Studio request (1 disables retries; default: 1).",
+    )
 
     args = parser.parse_args()
     skip_existing = not args.reprocess
@@ -652,18 +797,41 @@ if __name__ == "__main__":
         if not deduped:
             raise ValueError("No filenames were provided in list mode.")
 
-        process_selected_files(args.input_dir, args.output_dir, deduped, skip_existing=skip_existing)
+        process_selected_files(
+            args.input_dir,
+            args.output_dir,
+            deduped,
+            skip_existing=skip_existing,
+            request_timeout_seconds=args.request_timeout_seconds,
+            retry_attempts=args.retry_attempts,
+        )
 
     elif first_n_mode_enabled:
         if args.first_n < 1:
             raise ValueError("--first-n must be >= 1")
 
-        all_files = sorted(glob.glob(os.path.join(args.input_dir, "*.json")))
+        all_files = sorted(
+            f for f in glob.glob(os.path.join(args.input_dir, "*.json"))
+            if not os.path.basename(f).lower() == "law_doc.json"
+        )
         if not all_files:
             raise ValueError(f"No JSON files found in {args.input_dir}")
 
         selected = [os.path.basename(p) for p in all_files[: args.first_n]]
-        process_selected_files(args.input_dir, args.output_dir, selected, skip_existing=skip_existing)
+        process_selected_files(
+            args.input_dir,
+            args.output_dir,
+            selected,
+            skip_existing=skip_existing,
+            request_timeout_seconds=args.request_timeout_seconds,
+            retry_attempts=args.retry_attempts,
+        )
 
     else:
-        process_directory(args.input_dir, args.output_dir, skip_existing=skip_existing)
+        process_directory(
+            args.input_dir,
+            args.output_dir,
+            skip_existing=skip_existing,
+            request_timeout_seconds=args.request_timeout_seconds,
+            retry_attempts=args.retry_attempts,
+        )    

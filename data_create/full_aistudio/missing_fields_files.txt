@@ -2029,3 +2029,7 @@
 21-05-2025-Dong_Nai-2ta1972402t1cvn.json
 19-06-2025-Binh_Duong-2ta1854450t1cvn.json
 11-06-2025-Dien_Bien-2ta1849972t1cvn.json
+01-02-2024-Ben_Tre-2ta1648282t1cvn.json
+01-02-2024-Hai_Duong-2ta1428714t1cvn.json
+01-02-2024-Khanh_Hoa-2ta1430918t1cvn.json
+01-02-2024-Lai_Chau-2ta1656427t1cvn.json
