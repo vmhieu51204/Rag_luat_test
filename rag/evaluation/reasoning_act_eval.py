@@ -238,7 +238,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--query-fields",
-        default="Synthetic_summary,THONG_TIN_CHUNG.Thong_Tin_Bi_Cao",
+        default="Synthetic_summary_2,THONG_TIN_CHUNG.Thong_Tin_Bi_Cao",
         help="Comma-separated fields used for similar-case retrieval.",
     )
     parser.add_argument(

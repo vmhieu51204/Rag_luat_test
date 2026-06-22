@@ -172,7 +172,7 @@ def run_one_call_generation(
     input_fields: list[str] | None = None,
     omit_phan_tich_phap_ly: bool = False,
 ) -> dict[str, Any]:
-    input_fields = input_fields or ["THONG_TIN_CHUNG.Thong_Tin_Bi_Cao", "Synthetic_summary"]
+    input_fields = input_fields or ["THONG_TIN_CHUNG.Thong_Tin_Bi_Cao", "Synthetic_summary_2"]
     case_payload = _extract_input_payload(data, input_fields)
     if not case_payload:
         raise ValueError("empty_input_payload")
@@ -357,7 +357,7 @@ def main() -> None:
     parser.add_argument("--model", default=None)
     parser.add_argument(
         "--input-fields",
-        default="THONG_TIN_CHUNG.Thong_Tin_Bi_Cao,Synthetic_summary",
+        default="THONG_TIN_CHUNG.Thong_Tin_Bi_Cao,Synthetic_summary_2",
         help=(
             "Comma-separated fields passed to the one-call LLM prompt. "
             "Synthetic_summary may be a list of separate first-person defendant stories."

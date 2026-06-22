@@ -727,12 +727,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--input-dir",
-        default="data_create/extracted_fields",
+        default="data_create/extracted_fields/2023",
         help="Directory containing input stage2 JSON files",
     )
     parser.add_argument(
         "--output-dir",
-        default="data_create/full_aistudio",
+        default="data_create/full_aistudio/2023",
         help="Directory to write output stage3 JSON files",
     )
     parser.add_argument(

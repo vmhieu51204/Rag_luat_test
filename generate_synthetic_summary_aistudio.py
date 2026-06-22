@@ -15,7 +15,7 @@ from google.genai import types
 
 
 DEFAULT_MODEL_NAME = "gemma-4-31b-it"
-DEFAULT_INPUT_DIR = "chunk/test"
+DEFAULT_INPUT_DIR = "chunk/test/2023"
 DEFAULT_INPUT_FIELD = "NOI_DUNG_VU_AN"
 DEFAULT_OUTPUT_FIELD = "Synthetic_summary_2"
 DEFAULT_SLEEP_SECONDS = 20

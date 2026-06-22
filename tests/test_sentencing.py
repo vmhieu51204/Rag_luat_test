@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from rag.core.sentencing import LIFE_IMPRISONMENT_MONTHS, extract_imprisonment_months
+from rag.parse_penalty import parse_penalty_to_months
 
 
 class SentencingTests(unittest.TestCase):
@@ -18,6 +19,9 @@ class SentencingTests(unittest.TestCase):
         sentence = "09 năm tù, tổng hợp với án chung thân, hình phạt chung là tù chung thân"
 
         self.assertEqual(extract_imprisonment_months(sentence), LIFE_IMPRISONMENT_MONTHS)
+
+    def test_parse_prosecution_sentence_year_range_to_month_range(self):
+        self.assertEqual(parse_penalty_to_months("từ 05 đến 06 năm tù"), [60, 72])
 
 
 if __name__ == "__main__":

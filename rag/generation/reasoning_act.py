@@ -31,6 +31,7 @@ from rag.llm.providers import (
     generate_structured_output,
     generate_structured_output_with_fallback,
 )
+from rag.parse_penalty import parse_penalty_to_months
 from rag.runtime.retrieval import RetrievalRuntime
 
 MANDATORY_SUPPORTING_DIEU = ("38", "50", "51", "52", "53", "54", "55", "56", "57", "58", "65", "47")
@@ -409,6 +410,12 @@ def _prosecution_items(data: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
 
 
+def _with_parsed_prosecution_sentence(item: dict[str, Any]) -> dict[str, Any]:
+    out = dict(item)
+    out["Phat_Tu_month_range"] = parse_penalty_to_months(_normalize_space(item.get("Phat_Tu")))
+    return out
+
+
 def _prosecution_item_for_defendant(data: dict[str, Any], defendant_name: str | None) -> dict[str, Any] | None:
     items = _prosecution_items(data)
     if not items:
@@ -417,8 +424,8 @@ def _prosecution_item_for_defendant(data: dict[str, Any], defendant_name: str | 
         defendant_key = _name_key(defendant_name)
         for item in items:
             if _name_key(item.get("Bi_Cao")) == defendant_key:
-                return item
-    return items[0] if len(items) == 1 else None
+                return _with_parsed_prosecution_sentence(item)
+    return _with_parsed_prosecution_sentence(items[0]) if len(items) == 1 else None
 
 
 def _verdict_item_from_metadata(data: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any] | None:
@@ -812,7 +819,8 @@ def _final_prompt(
             "Use similar cases only for analogy and sentencing calibration, never to override statutory law.",
             (
                 "For sentencing_calibration_cases, read De_Nghi_Cua_Vien_Kiem_Sat.Phat_Tu as the prosecution's requested "
-                "prison range, and PHAN_QUYET_CUA_TOA_SO_THAM.Tang_nang, Giam_nhe, and Phat_Tu as the court's applied "
+                "prison range, De_Nghi_Cua_Vien_Kiem_Sat.Phat_Tu_month_range as its parsed [minimum, maximum] months, "
+                "and PHAN_QUYET_CUA_TOA_SO_THAM.Tang_nang, Giam_nhe, and Phat_Tu as the court's applied "
                 "aggravating factors, mitigating factors, and final prison term. Use these past cases only to calibrate "
                 "the current prison term by comparing how similar the current mitigation/aggravation factors are to the "
                 "retrieved cases."
@@ -842,8 +850,8 @@ def run_reasoning_act(
     top_k_case: int = 5,
     max_additional_law_rounds: int = 1,
 ) -> dict[str, Any]:
-    input_fields = input_fields or ["THONG_TIN_CHUNG.Thong_Tin_Bi_Cao", "Synthetic_summary"]
-    query_fields = query_fields or ["Synthetic_summary", "THONG_TIN_CHUNG.Thong_Tin_Bi_Cao"]
+    input_fields = input_fields or ["THONG_TIN_CHUNG.Thong_Tin_Bi_Cao", "Synthetic_summary_2"]
+    query_fields = query_fields or ["Synthetic_summary_2", "THONG_TIN_CHUNG.Thong_Tin_Bi_Cao"]
     train_articles_index = train_articles_index if train_articles_index is not None else load_articles_index(train_dir)[0]
 
     case_payload = extract_input_payload(data, input_fields)

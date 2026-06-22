@@ -29,8 +29,8 @@ from pathlib import Path
 from typing import Optional
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
-INPUT_DIR  = Path(__file__).parent / "extracted_json/2024-2025"
-OUTPUT_DIR = Path(__file__).parent / "extracted_fields/2024-2025"
+INPUT_DIR  = Path(__file__).parent / "extracted_json/2023"
+OUTPUT_DIR = Path(__file__).parent / "extracted_fields/2023"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  TEXT HELPERS (reused from extract_sections.py)

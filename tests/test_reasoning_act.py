@@ -261,8 +261,10 @@ class ReasoningActTests(unittest.TestCase):
         aggravation = next(item for item in cases if item.factor_type == "aggravation")
         self.assertEqual(mitigation.doc_id, "case-a")
         self.assertEqual(mitigation.prosecution_proposal["Phat_Tu"], "từ 02 năm đến 03 năm tù")
+        self.assertEqual(mitigation.prosecution_proposal["Phat_Tu_month_range"], [24, 36])
         self.assertEqual(mitigation.court_sentence, "02 năm tù")
         self.assertEqual(aggravation.doc_id, "case-c")
+        self.assertEqual(aggravation.prosecution_proposal["Phat_Tu_month_range"], [36, 48])
         self.assertEqual(aggravation.court_aggravation, "Phạm tội nhiều lần")
 
     def test_sentencing_calibration_caps_final_cases_per_issue(self):

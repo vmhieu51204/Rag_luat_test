@@ -29,8 +29,8 @@ import argparse
 import unicodedata
 from pathlib import Path
 
-INPUT_DIR  = Path(__file__).parent / "ocr_marker_fixed/2024-2025"
-OUTPUT_DIR = Path(__file__).parent / "extracted_json/2024-2025"
+INPUT_DIR  = Path(__file__).parent / "ocr_marker_fixed/2023"
+OUTPUT_DIR = Path(__file__).parent / "extracted_json/2023"
 
 #  TEXT HELPERS
 def strip_diacritics(text: str) -> str:

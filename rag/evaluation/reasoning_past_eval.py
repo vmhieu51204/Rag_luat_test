@@ -18,11 +18,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import unicodedata
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -47,8 +44,8 @@ from rag.llm.providers import (
     LLMProvider,
     default_model_for_provider,
     generate_structured_output,
+    generate_structured_output_with_fallback,
 )
-import rag.llm.providers as llm_providers
 from rag.core.embeddings import load_chroma, run_pipeline
 from rag.generation.reasoning_act import DEFAULT_REASON_ACT_TRAIN_FIELDS, MANDATORY_SUPPORTING_DIEU
 from rag.generation.schemas import GenerationOutput, build_output_schema_instruction
@@ -379,6 +376,17 @@ def _build_past_cases_context(
     return past_cases
 
 
+def _select_reference_court_reasoning(past_cases_context: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for item in past_cases_context:
+        court_reasoning = item.get("Court_Reasoning")
+        if court_reasoning:
+            return {
+                "doc_id": item.get("doc_id", ""),
+                "NHAN_DINH_CUA_TOA_AN": court_reasoning,
+            }
+    return None
+
+
 def _build_similar_case_clause_context(
     *,
     case_doc_ids: list[str],
@@ -450,6 +458,7 @@ def _build_prompts(
     defendant_info: str,
     explicit_law_clauses: list[dict[str, str]],
     past_cases_context: list[dict[str, Any]],
+    reference_court_reasoning: dict[str, Any] | None,
 ) -> tuple[str, str]:
     system_prompt = (
         "You are an expert Vietnamese criminal judgment assistant. "
@@ -465,6 +474,7 @@ def _build_prompts(
         "Predict Trach_Nhiem_Dan_Su when applicable.",
         "Use explicit_law_clauses (retrieved at Dieu level from similar past cases) as legal references and select only applicable clauses.",
         "Before producing output, reason from the provided case_fields, Defendant_info, and explicit_law_clauses.",
+        "Use reference_court_reasoning.NHAN_DINH_CUA_TOA_AN as a judicial reasoning reference from one retrieved similar case. Treat it as persuasive precedent only, not as ground truth for the current case.",
         "MANDATORY: You must evaluate and include applicable general sentencing provisions from the 50s articles (e.g., Article 51 for mitigating factors, Article 52 for aggravating factors, Articles 55/56 for sentence synthesis) in Applied_Law_Clauses.",
         "MANDATORY: You must compare the current case facts against the provided 'past_cases_context'. Use the judicial reasoning (NHAN_DINH_CUA_TOA_AN) of past cases to determine the correct Toi_Danh and Phat_Tu."
     ]
@@ -482,12 +492,14 @@ def _build_prompts(
         "Defendant_info": defendant_info,
         "explicit_law_clauses": explicit_law_clauses,
         "past_cases_context": past_cases_context,
+        "reference_court_reasoning": reference_court_reasoning,
         "task": {
             "requirement": requirements,
             "reasoning_instruction": [
                 "Use the factual timeline in case_fields to identify offense behavior.",
                 "Use Defendant_info for circumstances that affect sentencing and mitigating/aggravating factors.",
                 "Select applicable clauses from explicit_law_clauses before deciding Toi_Danh and Phat_Tu.",
+                "Use reference_court_reasoning as an example of court legal reasoning style and factor weighing. Apply only the parts that match the current case facts.",
                 "When calculating the final Phat_Tu, you must explicitly adjust the sentence length based on the presence of mitigating factors (Article 51), aggravating factors (Article 52), or previous convictions/synthesis (Articles 55/56) found in Defendant_info.",
                 "Analyze 'past_cases_context'. Compare weapons, intent, and severity in the past cases to the current case.",
                 "If the current facts closely mirror a past case, align your Toi_Danh and Phat_Tu predictions with that past case, adjusting for specific aggravating/mitigating factors."
@@ -500,83 +512,7 @@ def _build_prompts(
     return system_prompt, user_prompt
 
 
-def _get_aistudio_api_keys() -> list[tuple[str, str]]:
-    key_names = ("GOOGLE_API_KEY", "GOOGLE_API_KEY_2", "GOOGLE_API_KEY_3")
-    return [(key_name, api_key) for key_name in key_names if (api_key := os.environ.get(key_name))]
-
-
-def _reset_aistudio_client_cache() -> None:
-    if hasattr(llm_providers, "_aistudio_client"):
-        llm_providers._aistudio_client = None
-
-
-@contextmanager
-def _temporary_google_api_key(api_key: str) -> Iterator[None]:
-    previous = os.environ.get("GOOGLE_API_KEY")
-    os.environ["GOOGLE_API_KEY"] = api_key
-    _reset_aistudio_client_cache()
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop("GOOGLE_API_KEY", None)
-        else:
-            os.environ["GOOGLE_API_KEY"] = previous
-        _reset_aistudio_client_cache()
-
-
-def _generate_structured_output_aistudio_rotating_keys(
-    *,
-    model_name: str,
-    system_prompt: str,
-    user_prompt: str,
-    output_model: type[Any],
-) -> tuple[Any, dict[str, Any]]:
-    api_keys = _get_aistudio_api_keys()
-    if not api_keys:
-        raise EnvironmentError(
-            "No AI Studio API keys are set. Expected GOOGLE_API_KEY, GOOGLE_API_KEY_2, and/or GOOGLE_API_KEY_3."
-        )
-
-    errors: list[str] = []
-    attempts = [
-        {"provider": LLMProvider.AISTUDIO.value, "model": model_name, "key_name": key_name}
-        for key_name, _ in api_keys
-    ]
-    for key_name, api_key in api_keys:
-        try:
-            with _temporary_google_api_key(api_key):
-                parsed, usage = generate_structured_output(
-                    provider=LLMProvider.AISTUDIO,
-                    model_name=model_name,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    output_model=output_model,
-                )
-            usage = {
-                **usage,
-                "provider": LLMProvider.AISTUDIO.value,
-                "model": model_name,
-                "aistudio_key_name": key_name,
-                "aistudio_key_attempts": attempts,
-                "aistudio_key_errors": errors,
-            }
-            return parsed, usage
-        except Exception as exc:  # noqa: BLE001
-            error_msg = f"{key_name}:{exc}"
-            errors.append(error_msg)
-            print(f"    [Fallback] AI Studio ({key_name}) failed: {exc}")
-
-    raise RuntimeError("All AI Studio API key attempts failed. " + " | ".join(errors))
-
-
-def _openrouter_paid_model(openrouter_free_model: str) -> str:
-    if openrouter_free_model.endswith(":free"):
-        return openrouter_free_model.removesuffix(":free") + ":paid"
-    return openrouter_free_model + ":paid"
-
-
-def _generate_structured_output_with_aistudio_key_rotation(
+def _call_llm(
     *,
     provider: LLMProvider,
     model_name: str,
@@ -585,87 +521,21 @@ def _generate_structured_output_with_aistudio_key_rotation(
     output_model: type[Any],
     use_provider_fallback: bool,
 ) -> tuple[Any, dict[str, Any]]:
-    if not use_provider_fallback:
-        if provider == LLMProvider.AISTUDIO:
-            return _generate_structured_output_aistudio_rotating_keys(
-                model_name=model_name,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                output_model=output_model,
-            )
-        return generate_structured_output(
-            provider=provider,
+    if use_provider_fallback:
+        return generate_structured_output_with_fallback(
+            preferred_provider=provider,
             model_name=model_name,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             output_model=output_model,
         )
-
-    openrouter_free_model = model_name or default_model_for_provider(LLMProvider.OPENROUTER)
-    openrouter_paid_model = _openrouter_paid_model(openrouter_free_model)
-    ordered_attempts: list[tuple[LLMProvider, str]] = [
-        (LLMProvider.OPENROUTER, openrouter_free_model),
-        (LLMProvider.AISTUDIO, default_model_for_provider(LLMProvider.AISTUDIO)),
-        (LLMProvider.OPENROUTER, openrouter_paid_model),
-    ]
-
-    if provider == LLMProvider.AISTUDIO:
-        ordered_attempts = [
-            (LLMProvider.AISTUDIO, default_model_for_provider(LLMProvider.AISTUDIO)),
-            (LLMProvider.OPENROUTER, openrouter_free_model),
-            (LLMProvider.OPENROUTER, openrouter_paid_model),
-        ]
-    elif provider == LLMProvider.OPENAI:
-        ordered_attempts = [
-            (LLMProvider.OPENAI, model_name or default_model_for_provider(LLMProvider.OPENAI)),
-            (LLMProvider.OPENROUTER, openrouter_free_model),
-            (LLMProvider.AISTUDIO, default_model_for_provider(LLMProvider.AISTUDIO)),
-            (LLMProvider.OPENROUTER, openrouter_paid_model),
-        ]
-
-    attempt_errors: list[str] = []
-    seen: set[tuple[str, str]] = set()
-    last_error: Exception | None = None
-    for attempt_provider, attempt_model in ordered_attempts:
-        key = (attempt_provider.value, attempt_model)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        try:
-            if attempt_provider == LLMProvider.AISTUDIO:
-                parsed, usage = _generate_structured_output_aistudio_rotating_keys(
-                    model_name=attempt_model,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    output_model=output_model,
-                )
-            else:
-                parsed, usage = generate_structured_output(
-                    provider=attempt_provider,
-                    model_name=attempt_model,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    output_model=output_model,
-                )
-            usage = {
-                **usage,
-                "provider": attempt_provider.value,
-                "model": attempt_model,
-                "fallback_attempts": [
-                    {"provider": item_provider.value, "model": item_model}
-                    for item_provider, item_model in ordered_attempts
-                ],
-                "fallback_errors": attempt_errors,
-            }
-            return parsed, usage
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            attempt_errors.append(f"{attempt_provider.value}:{attempt_model}:{exc}")
-
-    if last_error is None:
-        raise RuntimeError("No provider attempt was executed")
-    raise RuntimeError("All provider fallback attempts failed. " + " | ".join(attempt_errors)) from last_error
+    return generate_structured_output(
+        provider=provider,
+        model_name=model_name,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        output_model=output_model,
+    )
 
 
 def _evaluate_single_doc(
@@ -714,12 +584,13 @@ def _evaluate_single_doc(
         train_articles_index=train_articles_index,
     )
 
-    # Fetch narrative context for the top 2 cases
+    # Fetch narrative context for the top retrieved cases.
     past_cases_context = _build_past_cases_context(
         case_doc_ids=similar_case_doc_ids,
         train_dir=train_dir,
         max_cases=MAX_FINAL_CASES_PER_ISSUE
     )
+    reference_court_reasoning = _select_reference_court_reasoning(past_cases_context)
 
     forced_clause_set = set(similar_case_context.get("similar_case_law_clause_set", []))
     forced_clause_set |= set(ALWAYS_INCLUDE_DIEU)
@@ -742,6 +613,7 @@ def _evaluate_single_doc(
         defendant_info=defendant_info,
         explicit_law_clauses=explicit_law_clauses,
         past_cases_context=past_cases_context,
+        reference_court_reasoning=reference_court_reasoning,
     )
 
     usage: dict[str, Any] = {}
@@ -752,7 +624,7 @@ def _evaluate_single_doc(
     llm_used_model = model_name
 
     try:
-        pred_output, usage = _generate_structured_output_with_aistudio_key_rotation(
+        pred_output, usage = _call_llm(
             provider=provider,
             model_name=model_name,
             system_prompt=system_prompt,
@@ -779,6 +651,7 @@ def _evaluate_single_doc(
             "similar_case_context": {
                 "similar_case_doc_ids": similar_case_context.get("similar_case_doc_ids", []),
                 "similar_case_law_clause_set": similar_case_context.get("similar_case_law_clause_set", []),
+                "reference_court_reasoning_doc_id": (reference_court_reasoning or {}).get("doc_id", ""),
             },
             "explicit_law_clauses": explicit_law_clause_log,
             "defendants": [
@@ -863,6 +736,7 @@ def _evaluate_single_doc(
         "similar_case_context": {
             "similar_case_doc_ids": similar_case_context.get("similar_case_doc_ids", []),
             "similar_case_law_clause_set": similar_case_context.get("similar_case_law_clause_set", []),
+            "reference_court_reasoning_doc_id": (reference_court_reasoning or {}).get("doc_id", ""),
         },
         "explicit_law_clauses": explicit_law_clause_log,
         "llm": {
@@ -957,12 +831,12 @@ def main() -> None:
     parser.add_argument("--max-chunk-chars", type=int, default=DEFAULT_MAX_CHUNK_CHARS)
     parser.add_argument(
         "--input-fields",
-        default="Synthetic_summary",
+        default="THONG_TIN_CHUNG.Thong_Tin_Bi_Cao,Synthetic_summary_2",
         help="Comma-separated fields to pass to the LLM payload",
     )
     parser.add_argument(
         "--query-fields",
-        default="Synthetic_summary",
+        default="Synthetic_summary_2,THONG_TIN_CHUNG.Thong_Tin_Bi_Cao",
         help="Comma-separated fields used to form embedding retrieval query",
     )
     parser.add_argument(

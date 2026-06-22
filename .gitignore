@@ -21,3 +21,13 @@ save.md
 act_full.json.before_malformed_filter.bak
 analysis_act_full.txt
 act_full.json.bak
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# LaTeX, Text and CSV files
+*.tex
+*.txt
+*.csv
+

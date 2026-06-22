@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from enum import Enum
 from typing import Any, TypeVar
 
@@ -129,6 +131,76 @@ def _generate_with_aistudio(
     return parsed, usage
 
 
+def _get_aistudio_api_keys() -> list[tuple[str, str]]:
+    key_names = ("GOOGLE_API_KEY", "GOOGLE_API_KEY_2", "GOOGLE_API_KEY_3")
+    return [(key_name, api_key) for key_name in key_names if (api_key := os.environ.get(key_name))]
+
+
+def _reset_aistudio_client_cache() -> None:
+    global _aistudio_client
+    try:
+        _aistudio_client = None
+    except NameError:
+        pass
+
+
+@contextmanager
+def _temporary_google_api_key(api_key: str) -> Iterator[None]:
+    previous = os.environ.get("GOOGLE_API_KEY")
+    os.environ["GOOGLE_API_KEY"] = api_key
+    _reset_aistudio_client_cache()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("GOOGLE_API_KEY", None)
+        else:
+            os.environ["GOOGLE_API_KEY"] = previous
+        _reset_aistudio_client_cache()
+
+
+def _generate_with_aistudio_rotating_keys(
+    *,
+    model_name: str,
+    system_prompt: str,
+    user_prompt: str,
+    output_model: type[TModel],
+) -> tuple[TModel, dict[str, Any]]:
+    api_keys = _get_aistudio_api_keys()
+    if not api_keys:
+        raise EnvironmentError(
+            "No AI Studio API keys are set. Expected GOOGLE_API_KEY, GOOGLE_API_KEY_2, and/or GOOGLE_API_KEY_3."
+        )
+
+    errors: list[str] = []
+    attempts = [
+        {"provider": LLMProvider.AISTUDIO.value, "model": model_name, "key_name": key_name}
+        for key_name, _ in api_keys
+    ]
+    for key_name, api_key in api_keys:
+        try:
+            with _temporary_google_api_key(api_key):
+                parsed, usage = _generate_with_aistudio(
+                    model_name=model_name,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    output_model=output_model,
+                )
+            usage = {
+                **usage,
+                "provider": LLMProvider.AISTUDIO.value,
+                "model": model_name,
+                "aistudio_key_name": key_name,
+                "aistudio_key_attempts": attempts,
+                "aistudio_key_errors": errors,
+            }
+            return parsed, usage
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{key_name}:{exc}")
+
+    raise RuntimeError("All AI Studio API key attempts failed. " + " | ".join(errors))
+
+
 def _generate_with_openrouter(
     *,
     model_name: str,
@@ -215,7 +287,7 @@ def generate_structured_output(
     selected_model = model_name or default_model_for_provider(provider_enum)
 
     if provider_enum == LLMProvider.AISTUDIO:
-        return _generate_with_aistudio(
+        return _generate_with_aistudio_rotating_keys(
             model_name=selected_model,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -291,13 +363,21 @@ def generate_structured_output_with_fallback(
         seen.add(key)
 
         try:
-            parsed, usage = generate_structured_output(
-                provider=provider,
-                model_name=attempt_model,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                output_model=output_model,
-            )
+            if provider == LLMProvider.AISTUDIO:
+                parsed, usage = _generate_with_aistudio_rotating_keys(
+                    model_name=attempt_model,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    output_model=output_model,
+                )
+            else:
+                parsed, usage = generate_structured_output(
+                    provider=provider,
+                    model_name=attempt_model,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    output_model=output_model,
+                )
             usage = {
                 **usage,
                 "provider": provider.value,
