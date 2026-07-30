@@ -11,7 +11,7 @@ An end-to-end **Retrieval-Augmented Generation (RAG)** and **Multi-Stage ReAct R
 ---
 
 ## 🌟 Key Features
-
+- **Dataset construction pipeline**: Combine OCR and LLM processing to create a highly structured and accurate dataset of past criminal caselaw.
 - **Dual-Index Vector Retrieval**: Combines statutory law clause matching with historical case precedent retrieval using `BAAI/bge-m3` sentence embeddings stored in ChromaDB collections.
 - **Multi-Stage ReAct Reasoning**: Decouples legal analysis into distinct LLM reasoning steps:
   1. *Fact & Entity Extraction*
@@ -25,60 +25,35 @@ An end-to-end **Retrieval-Augmented Generation (RAG)** and **Multi-Stage ReAct R
 
 ---
 
-## 🏗️ System Architecture
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor User as User / Streamlit UI
-    participant Data as Case & Law Datasets
-    participant RAG as RAG Runtime (ChromaDB + BGE-M3)
-    participant Agent as ReAct Reasoning Agent
-    participant LLM as LLM Provider (Gemini / OpenAI)
-
-    User->>Agent: Input Case Facts / Summary
-    Agent->>Data: Parse Defendant & Case Elements
-    Agent->>RAG: Retrieve Top-K Similar Precedent Cases
-    RAG-->>Agent: Return Precedent Cases & Associated Articles
-    Agent->>RAG: Retrieve Canonical Statutory Law Clauses
-    RAG-->>Agent: Return Full Text of Applicable Articles (BLHS)
-    Agent->>LLM: Prompt LLM with Facts + Precedents + Legal Text
-    LLM-->>Agent: Return JSON Output Validated by Pydantic
-    Agent-->>User: Display Verdict, Legal Basis & Penalty Prediction
-```
-
----
-
 ## 📊 Benchmark & Evaluation Results
 
-We evaluated our **Retrieval-Grounded Reasoning** system against two baseline architectures on held-out criminal case test sets:
-1. **Retrieval-Grounded Reasoning (Ours)**: Multi-stage ReAct reasoning pipeline with explicit statutory law text and precedent retrieval.
+The **Retrieval-Grounded Reasoning** system is evaluated against two baseline architectures on held-out criminal case test sets:
+1. **Retrieval-Grounded Reasoning**: Multi-stage ReAct reasoning pipeline with explicit statutory law text and precedent retrieval.
 2. **Single-Step Reasoning**: Direct LLM verdict generation without multi-stage legal text grounding.
 3. **Past-Case Reasoning**: Baseline relying on past judgments without explicit statutory law clause grounding.
 
 ### 1. Legal Clause Identification Performance
 
-| Metric | Retrieval-Grounded (Ours) | Single-Step Baseline | Past-Case Baseline | Improvement over Baseline |
+| Metric | Retrieval-Grounded | Single-Step Baseline | Past-Case Baseline | Improvement over Baseline |
 |---|:---:|:---:|:---:|:---:|
 | **Full-Signature Law $F_1$** (`Điều-Khoản-Điểm`) | **0.4893** | 0.2821 | 0.2954 | **+73.4% relative gain** |
 | **Article-Level Law $F_1$** (`Điều` Only) | **0.6197** | 0.5896 | 0.3861 | **+5.1% gain** |
 | **Offence-Article $F_1$** | **0.6561** | 0.6201 | 0.4150 | **+5.8% gain** |
 | **Exact Article-Set Match Rate** | **10.20%** | 8.89% | 8.89% | **+14.7% relative gain** |
 
-> 💡 **Key Insight on Legal Basis Grounding**:
 > The most notable improvement is observed in strict **full-signature law $F_1$** (**0.4893** vs 0.2821 for Single-Step and 0.2954 for Past-Case). This demonstrates that explicitly retrieving and reasoning over multi-step statutory law text (`Khoản`, `Điểm`) is essential for identifying precise legal bases rather than just broad article categories.
 
 ---
 
 ### 2. Sentence Duration Prediction Performance (Imprisonment Months - Lower is Better)
 
-| Metric (in Months) | Retrieval-Grounded (Ours) | Single-Step Baseline | Past-Case Baseline | Error Reduction |
+| Metric (in Months) | Retrieval-Grounded | Single-Step Baseline | Past-Case Baseline | Error Reduction |
 |---|:---:|:---:|:---:|:---:|
-| **Sentence MAE (Months)** | **34.48** | 57.00 | 73.63 | **39.5% reduction** vs Single-Step |
+| **Sentence MAE (Months)** | **34.48** | 57.00 | 52.63 | **39.5% reduction** vs Single-Step |
 | **Sentence RMSE (Months)** | **35.48** | 59.91 | 53.97 | **40.8% reduction** vs Single-Step |
 
 > 💡 **Key Insight on Sentencing Accuracy**:
-> The multi-step retrieval-grounded pipeline significantly minimizes sentencing deviation. Carelessly injecting past cases without structured statutory evaluation severely confuses the model regarding sentencing duration (Past-Case MAE spikes to **73.63 months**). Grounding the LLM with mandatory statutory articles (Articles 38, 50, 51, 52) provides precise penalty bracket constraints and cuts sentencing error down to **34.48 months**.
+> The multi-step retrieval-grounded pipeline significantly minimizes sentencing deviation. Grounding the LLM with mandatory statutory articles (Articles 38, 50, 51, 52) provides precise penalty bracket constraints and reduces sentencing error.
 
 ---
 
@@ -201,10 +176,6 @@ vietnamese-legal-rag/
 │   ├── pipeline.py             # Demo reasoning execution pipeline
 │   └── retrieval.py            # Streamlit-specific retrieval helpers
 ├── data_create/                # Data extraction & synthetic text generation scripts
-├── docs/                       # Comprehensive documentation & thesis reports
-│   ├── thesis_report.md        # Full technical thesis report
-│   ├── reasoning_pipeline.md   # Detailed multi-stage ReAct prompt specifications
-│   └── evaluation_guide.md     # Metric definitions & evaluation design
 ├── notebooks/                  # Interactive Jupyter Demonstration Notebooks
 │   ├── 01_multistage_reasoning_demo.ipynb
 │   ├── 02_evaluation_metrics_report.ipynb
