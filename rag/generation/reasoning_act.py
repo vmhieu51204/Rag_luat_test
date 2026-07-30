@@ -748,10 +748,19 @@ def _legal_analysis_prompt(
         "doc_id": doc_id,
         "facts": facts_and_candidates.facts.model_dump(),
         "candidates": [item.model_dump() for item in facts_and_candidates.candidates],
+        "mitigation_factors": facts_and_candidates.mitigation_factors,
+        "aggravation_factors": facts_and_candidates.aggravation_factors,
         "retrieved_offence_articles": [item.model_dump() for item in offence_articles],
         "retrieved_additional_articles": [item.model_dump() for item in additional_articles],
         "retrieved_supporting_articles": [item.model_dump() for item in supporting_articles],
         "additional_law_round": additional_law_round,
+        "context_from_stage_2": (
+            "mitigation_factors and aggravation_factors are atomic, per-defendant strings extracted from the case "
+            "facts in the previous analysis step. Each string identifies one standalone mitigating or aggravating "
+            "circumstance. Use them to accurately classify Article 51 (mitigation) and Article 52 (aggravation) "
+            "applicability and to populate supporting_article_assessments.factual_trigger for those articles. "
+            "Do not duplicate or merge factors across defendants."
+        ),
         "rules": [
             "Statutory law controls charge and sentencing-frame selection.",
             (
@@ -770,7 +779,7 @@ def _legal_analysis_prompt(
             "If additional law is needed, still provide the best provisional selected_offence from the available law.",
             "Reject or downgrade every non-selected candidate with a concise reason.",
             "Classify every supporting article as applicable, fact_dependent, not_applicable, or not_retrieved.",
-            "For every supporting article status, explain the factual trigger.",
+            "For every supporting article status, explain the factual trigger using the provided mitigation_factors and aggravation_factors where applicable.",
             "Do not cite/apply a supporting article merely because it was retrieved.",
             "Do not infer unknown facts as true.",
         ],
@@ -784,6 +793,7 @@ def _final_prompt(
     *,
     doc_id: str,
     case_payload: dict[str, str],
+    facts_and_candidates: ReasonActAnalysisOutput,
     legal_analysis: ReasonActLegalAnalysis,
     offence_articles: list[RetrievedLawArticle],
     additional_articles: list[RetrievedLawArticle],
@@ -801,6 +811,20 @@ def _final_prompt(
                 "Generate one defendants entry for each defendant story and use only that defendant's own story plus shared case facts for individual sentencing factors."
             ),
         },
+        "facts_from_stage_1": facts_and_candidates.facts.model_dump(),
+        "mitigation_factors": facts_and_candidates.mitigation_factors,
+        "aggravation_factors": facts_and_candidates.aggravation_factors,
+        "context_from_prior_stages": (
+            "facts_from_stage_1 contains structured facts (defendants, conduct, dates, victims, property_value, "
+            "harm, admissions, prior_convictions, mitigation_signals, aggravation_signals) extracted verbatim from "
+            "the case text in the first stage. "
+            "mitigation_factors and aggravation_factors are atomic, per-defendant strings distilled from those facts "
+            "during the first stage. Each string is a standalone sentencing-relevant circumstance. "
+            "Use facts_from_stage_1 together with case_fields when filling in Phan_Tich_Phap_Ly, Phat_Tu, and "
+            "Xu_Ly_Vat_Chung. Use mitigation_factors and aggravation_factors to calibrate the final prison term "
+            "against the sentencing_calibration_cases: match each current factor string to the most similar past "
+            "court_mitigation/court_aggravation entry and adjust the predicted Phat_Tu accordingly."
+        ),
         "legal_analysis": legal_analysis.model_dump(),
         "retrieved_offence_articles": [item.model_dump() for item in offence_articles if item.found],
         "retrieved_additional_articles": [item.model_dump() for item in additional_articles if item.found],
@@ -822,8 +846,8 @@ def _final_prompt(
                 "prison range, De_Nghi_Cua_Vien_Kiem_Sat.Phat_Tu_month_range as its parsed [minimum, maximum] months, "
                 "and PHAN_QUYET_CUA_TOA_SO_THAM.Tang_nang, Giam_nhe, and Phat_Tu as the court's applied "
                 "aggravating factors, mitigating factors, and final prison term. Use these past cases only to calibrate "
-                "the current prison term by comparing how similar the current mitigation/aggravation factors are to the "
-                "retrieved cases."
+                "the current prison term by comparing how similar the current mitigation_factors and aggravation_factors "
+                "are to the retrieved cases' court_mitigation and court_aggravation."
             ),
             "Predict concrete Phat_Tu, additional fine, civil/property consequences, and Xu_Ly_Vat_Chung when supported.",
             "For mitigation advice, only mention lawful cooperation, restitution, documentation, and procedural steps.",
@@ -965,6 +989,7 @@ def run_reasoning_act(
     system, user = _final_prompt(
         doc_id=doc_id,
         case_payload=case_payload,
+        facts_and_candidates=facts_and_candidates,
         legal_analysis=legal_analysis,
         offence_articles=offence_articles,
         additional_articles=additional_articles,
