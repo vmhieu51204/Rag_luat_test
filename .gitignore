@@ -1,12 +1,36 @@
-# Ignore JSON and Markdown files anywhere in the repository
-**/*.json
-**/*.md
-
-# Ignore environment files
+# Environment files
 .env
 *.env
+.venv/
+env/
+venv/
 
-# Generated retrieval/vector DB artifacts
+# Python bytecode & cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.dist/
+build/
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Datasets & JSON files
+**/*.json
+*.json
+data/*.bak
+data/*.tmp
+*.bak
+
+# Generated retrieval / vector DB artifacts
 output/chroma_db_*/
 output/generation_eval/*_db/
 output/**/chroma.sqlite3
@@ -16,18 +40,6 @@ output/**/header.bin
 output/**/length.bin
 output/**/link_lists.bin
 
-save.md
-
-act_full.json.before_malformed_filter.bak
-analysis_act_full.txt
-act_full.json.bak
-
-# Python bytecode
-__pycache__/
-*.pyc
-
-# LaTeX, Text and CSV files
-*.tex
-*.txt
-*.csv
-
+# OS metadata
+.DS_Store
+Thumbs.db
